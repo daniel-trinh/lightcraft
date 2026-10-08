@@ -700,3 +700,36 @@ fn ai_preset_buttons_require_a_model_and_keep_the_requested_kind() {
         }
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_generation_setup_requires_consent_and_no_external_server_fields() {
+    use lightcraft_engine::generative_model::Generator;
+    let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), Services::default());
+    let mut h = Headless::new(app, [1200.0, 1400.0], 1.0);
+    assert_eq!(h.request("ui.set", json!({"view":"detail"}), T)["ok"], true);
+    assert_eq!(h.request("engine.execute", json!({"command":"panel.remove"}), T)["ok"], true);
+    h.app.session.generator.dir = Some(std::env::temp_dir().join(format!("lc-ui-inpaint-absent-{}", std::process::id())));
+    h.step();
+    assert!(!h.app.widgets.iter().any(|(id, _)| matches!(id.as_str(), "field:generativeEndpoint" | "field:generativeCheckpoint")));
+    assert!(!h.app.session.generator.download_status().running);
+    if !Generator::AVAILABLE {
+        return;
+    }
+    assert!(!h.app.ui.generative_model_ack);
+    let n = h.app.session.catalog.photos().count();
+    // A disabled download button must not start setup or accept licence terms.
+    h.request("ui.clickWidget", json!({"id":"button:generativeDownloadModel"}), T);
+    assert!(!h.app.session.generator.download_status().running);
+    assert!(!h.app.ui.generative_model_ack);
+    assert_eq!(h.app.session.catalog.photos().count(), n);
+    // Checking consent alone does not download. Consent is not retained in saved UI settings.
+    let r = h.request("ui.clickWidget", json!({"id":"checkbox:generativeModelConsent"}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(h.app.ui.generative_model_ack);
+    assert!(!h.app.session.generator.download_status().running);
+    let saved = serde_json::to_value(&h.app.ui).unwrap();
+    assert!(saved.get("generativeModelAck").is_none());
+    let restored: crate::state::UiState = serde_json::from_value(saved).unwrap();
+    assert!(!restored.generative_model_ack);
+}

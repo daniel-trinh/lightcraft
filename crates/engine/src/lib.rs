@@ -22,6 +22,8 @@ pub mod export;
 pub mod files;
 pub mod fonts;
 pub mod generative;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod generative_model;
 pub mod guard;
 pub mod import;
 mod import_move;
@@ -158,6 +160,8 @@ pub struct Session {
     pub active_mask: Option<u32>,
     /// AI masks (SAM 3): the model and the last photo prepared for it.
     pub segmenter: segment::Segmenter,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub generator: generative_model::Generator,
     /// Selected spot (Remove panel), by index into the active photo's spots.
     pub active_spot: Option<usize>,
     /// The persistent library this session writes to (`None` = in-memory only).
@@ -247,6 +251,8 @@ impl Session {
             depth: 0,
             active_mask: None,
             segmenter: segment::Segmenter::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            generator: generative_model::Generator::default(),
             active_spot: None,
             library: None,
             xmp: sidecar::XmpPrefs::default(),

@@ -284,7 +284,7 @@ LightCraft is young and moving fast. **Where we honestly stand** (details in the
 - **The biggest gaps:**
   - **camera colour calibration:** raws other than DNG develop with a neutral colour matrix today, so colour is muted;
   - **CR3 and compressed Fujifilm / Olympus raws:** these open as embedded previews only;
-  - **AI:** optional local SAM 3 masking presets and local ComfyUI generative fill/remove are experimental in this fork; model setup is required, and AI denoise is unfinished;
+  - **AI:** optional local SAM 3 masking presets and app-managed native generative fill/remove are experimental in this fork; one-time model setup is required, and AI denoise is unfinished;
   - **HDR, video and the Classic Print / Book / Map modules.**
 - **What's next:** see [where we're going](ROADMAP.md#where-were-going).
 

@@ -7,10 +7,12 @@ projects (DrawCraft reached its first four milestones in ≈ 4½ h) and are revi
 ## Where we stand
 
 **AI fork update, 2026-10-07:** optional SAM 3 presets now select sky, people, subject and
-background, with model results stored in masks. Local ComfyUI generative fill/remove uses a
-selected mask and creates a new PNG/catalog photo. This is an experimental integration:
-models must be installed separately, image quality is not yet verified, and generated output
-is capped at 1024 px in the UI (2048 px by command). The upstream readiness estimates below
+background, with model results stored in masks. App-managed native SD 1.5 generative fill/remove
+uses a selected mask and creates a new PNG/catalog photo. This is an experimental integration:
+the app offers a separate model download, real Fill/Remove tests pass on procedural images,
+but generated content remains rough. Native output
+is capped at 512 px (advanced ComfyUI commands support 2048 px). Windows inference uses CPU.
+The upstream readiness estimates below
 remain historical; this does not establish Lightroom AI parity.
 
 *Honest assessment, 2026-10-05. Agents: read this before picking work. The checklist in

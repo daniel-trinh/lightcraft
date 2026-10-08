@@ -31,6 +31,7 @@ lightcraft-ui-egui = { path = "crates/ui-egui" }
 lightcraft-mcp = { path = "crates/mcp" }
 lightcraft-fetch = { path = "crates/fetch" }
 lightcraft-segment = { path = "crates/segment" }
+lightcraft-inpaint = { path = "crates/inpaint" }
 
 # foundation
 thiserror = "2"
@@ -68,6 +69,7 @@ ravif = { version = "0.13", default-features = false, features = ["threading"] }
 # Oniguruma C library into candle-core, and the product is pure Rust.
 candle-core = { version = "=0.9.2", default-features = false }
 candle-nn = { version = "=0.9.2", default-features = false }
+candle-transformers = { version = "=0.9.2", default-features = false }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }
 pollster = "1"
 

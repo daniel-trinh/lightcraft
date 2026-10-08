@@ -27,6 +27,13 @@ the facebook/sam3 checkpoint only when they choose to (in the app, or by hand), 
 License (https://github.com/facebookresearch/sam3/blob/main/LICENSE), a separate, non-OSI
 licence. See docs/ai-masks.md.
 
+crates/inpaint (lightcraft-inpaint) uses Hugging Face Candle's Stable Diffusion APIs
+(https://github.com/huggingface/candle, MIT OR Apache-2.0). Its CLIP tokenizer is adapted
+from crates/segment's Apache-2.0 port, modified in 2026 for Stable Diffusion's 77-token
+context. crates/inpaint is therefore licensed under Apache-2.0 only (LICENSE-APACHE).
+The SD 1.5 inpainting model weights are not distributed with LightCraft. Users download
+them separately under CreativeML OpenRAIL-M; see docs/generative-fill.md.
+
 Builds made with craft-fonts (the optional CRAFT_FONTS_DIR build input; all official releases)
 also embed the fonts listed in https://github.com/storytold/craft-fonts/blob/main/ATTRIBUTION.md
 (the Japanese fonts BIZ UDPGothic, BIZ UDMincho and Shippori Mincho; the web build embeds only BIZ

@@ -15,6 +15,8 @@ mod edit;
 mod export;
 pub mod filters;
 mod generative;
+#[cfg(not(target_arch = "wasm32"))]
+mod generative_model;
 pub mod keywords;
 pub mod library;
 pub mod lut_profiles;
@@ -137,6 +139,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(prefs::specs());
         v.extend(export::specs());
         v.extend(generative::specs());
+        #[cfg(not(target_arch = "wasm32"))]
+        v.extend(generative_model::specs());
         v.extend(before::specs());
         v.extend(browse::specs());
         v.extend(missing::specs());

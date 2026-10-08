@@ -1,26 +1,41 @@
-//! Local, optional generative fill from a selected mask and a ComfyUI inpainting checkpoint.
+//! Local generative fill from a selected mask, with native inference by default.
 
 use lightcraft_catalog::PhotoId;
 use serde_json::{Value, json};
 use std::io::Read;
 
 use super::{CommandSpec, bad, cmd, has_active};
-use crate::{Result, Session, generative::Options};
+use crate::{
+    Result, Session,
+    generative::{Backend, Options},
+};
 
 pub fn options(p: &Value) -> Result<Options> {
     const C: &str = "photo.generativeFill";
+    let backend = match p.get("backend").and_then(Value::as_str) {
+        Some("native") => Backend::Native,
+        Some("comfy") => Backend::Comfy,
+        Some(value) => return Err(bad(C, format!("unknown backend '{value}'; choose native or comfy"))),
+        None if p.get("endpoint").is_some() || p.get("checkpoint").is_some() => Backend::Comfy,
+        None => Backend::Native,
+    };
     let o = Options {
+        backend,
         endpoint: p.get("endpoint").and_then(Value::as_str).unwrap_or("http://127.0.0.1:8188").to_string(),
         checkpoint: p.get("checkpoint").and_then(Value::as_str).unwrap_or_default().to_string(),
         prompt: p.get("prompt").and_then(Value::as_str).unwrap_or_default().to_string(),
         negative: p.get("negative").and_then(Value::as_str).unwrap_or_default().to_string(),
         steps: p.get("steps").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(24),
+        guidance: p.get("guidance").and_then(Value::as_f64).unwrap_or(7.5),
         denoise: p.get("denoise").and_then(Value::as_f64).unwrap_or(1.0) as f32,
         seed: p
             .get("seed")
             .and_then(Value::as_u64)
             .unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64),
-        edge: p.get("edge").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(1024),
+        edge: p.get("edge").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(match backend {
+            Backend::Native => 512,
+            Backend::Comfy => 1024,
+        }),
     };
     o.validate().map_err(|e| bad(C, e))?;
     Ok(o)
@@ -87,7 +102,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Generative Fill",
             [],
             None,
-            "{maskId, endpoint?: localhost ComfyUI URL, checkpoint: installed inpainting checkpoint filename, prompt?: text (empty removes), negative?, steps?: 24, denoise?: 1, seed?, edge?: 1024, dir?: demo destination} — generate selected mask as a new PNG and library photo; original is retained → {id, path, original}",
+            "{maskId, backend?: native|comfy (native default), prompt?: text (empty removes), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512, denoise?: 1 (native only supports 1), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — generate selected mask as a new PNG and library photo; original is retained → {id, path, original}",
             has_active,
             fill
         ),
@@ -96,7 +111,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Generative Remove",
             [],
             None,
-            "{maskId, endpoint?: localhost ComfyUI URL, checkpoint: installed inpainting checkpoint filename, negative?, steps?: 24, denoise?: 1, seed?, edge?: 1024, dir?: demo destination} — remove the selected area using background-matching prompts, saving a separate PNG and library photo → {id, path, original}",
+            "{maskId, backend?: native|comfy (native default), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512, denoise?: 1 (native only supports 1), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — remove the selected area using background-matching prompts, saving a separate PNG and library photo → {id, path, original}",
             has_active,
             remove
         ),
@@ -117,6 +132,74 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    /// Explicit developer QA: downloads are separate from this test and all test pictures
+    /// come from the procedural demo library. Normal CI does not need multi-GB model files.
+    #[cfg(all(feature = "inpaint", not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore = "requires LIGHTCRAFT_INPAINT_TEST_MODEL and LIGHTCRAFT_INPAINT_TEST_OUTPUT"]
+    fn native_fill_and_remove_with_pinned_checkpoint() {
+        let model = std::env::var_os("LIGHTCRAFT_INPAINT_TEST_MODEL").expect("model directory");
+        let output = std::path::PathBuf::from(std::env::var_os("LIGHTCRAFT_INPAINT_TEST_OUTPUT").expect("output directory"));
+        std::fs::create_dir_all(&output).unwrap();
+        let mut s = Session::with_demo();
+        s.generator.dir = Some(model.into());
+        assert!(s.generator.installed());
+        let source = s.active().unwrap();
+        s.execute("crop.set", &json!({"rect":[0.1,0.1,0.9,0.9]})).unwrap();
+        s.execute("mask.add", &json!({"kind":"radial","center":[0.5,0.6],"rx":0.18,"ry":0.16})).unwrap();
+        let mid = s.active_mask.unwrap();
+        let original_photo = s.catalog.photo(source).unwrap().clone();
+        let expected = s.render_job(source, 256, 256, false, true).unwrap().run().rendered.unwrap().image;
+        let mask = s
+            .render_job(source, 256, 256, false, true)
+            .unwrap()
+            .with_overlay(lightcraft_pipeline::Overlay::Mask {
+                id: mid as u16,
+                view: lightcraft_pipeline::MaskView::WhiteOnBlack,
+                color: [255; 3],
+                opacity: 100,
+            })
+            .run()
+            .rendered
+            .unwrap()
+            .image;
+        for (name, image) in [("native-source.png", &expected), ("native-mask.png", &mask)] {
+            let png =
+                lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(image), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+            std::fs::write(output.join(name), png).unwrap();
+        }
+        for command in ["photo.generativeFill", "photo.generativeRemove"] {
+            s.selection = crate::Selection::single(source);
+            s.active_mask = Some(mid);
+            let before = s.undo.len();
+            let started = std::time::Instant::now();
+            let r = s.execute(command,&json!({"maskId":mid,"edge":256,"steps":16,"seed":42,"prompt":"yellow flowers growing beside a mountain lake, natural photograph","negative":"red square, text, watermark","dir":output})).unwrap();
+            eprintln!("{command}: {:.2}s -> {}", started.elapsed().as_secs_f64(), r["path"]);
+            let path = r["path"].as_str().unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            let generated = lightcraft_codecs::decode(&bytes, lightcraft_codecs::DecodeOptions::default()).unwrap().to_srgb8();
+            assert_eq!((generated.width, generated.height), (expected.width, expected.height));
+            let mut outside = 0;
+            let mut changed = 0;
+            for ((original, result), alpha) in expected.data.iter().zip(&generated.data).zip(&mask.data) {
+                if alpha[0] == 0 {
+                    assert_eq!(original, result);
+                    outside += 1;
+                } else if original != result {
+                    changed += 1;
+                }
+            }
+            assert!(outside > 0 && changed > 0, "generated content must change the selected area only");
+            assert_eq!(s.catalog.photo(source).unwrap().develop, original_photo.develop);
+            assert_eq!(s.undo.len(), before + 1);
+            let generated_id = PhotoId(r["id"].as_u64().unwrap());
+            s.execute("edit.undo", &json!({})).unwrap();
+            assert!(s.catalog.photo(source).is_some());
+            assert!(s.catalog.photo(generated_id).is_none());
+            assert!(std::path::Path::new(path).is_file());
+        }
+    }
 
     #[test]
     fn cropped_generation_round_trip_preserves_unselected_pixels() {

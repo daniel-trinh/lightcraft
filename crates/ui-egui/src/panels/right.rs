@@ -350,16 +350,52 @@ fn remove(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
 fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     const LABEL: &str = "Generative Fill";
     divider(ui);
-    header(ui, "Generative Fill (local ComfyUI)");
+    header(ui, "Generative Fill and Remove");
     padded(ui, |ui| {
         ui.label("Select a mask in Masking. Fill replaces it using your prompt; Remove reconstructs its background. Each result is a new photo.");
-        ui.label("Generated copies have an edge of at most 1024 px in the desktop app.");
-        ui.label("ComfyUI URL");
-        let r = ui.text_edit_singleline(&mut app.ui.generative_endpoint);
-        register(ui.ctx(), "field:generativeEndpoint", r.rect);
-        ui.label("Installed inpainting checkpoint filename");
-        let r = ui.text_edit_singleline(&mut app.ui.generative_checkpoint);
-        register(ui.ctx(), "field:generativeCheckpoint", r.rect);
+        ui.label("Runs on your computer. Generated copies have an edge of at most 512 px.");
+        if !lightcraft_engine::generative_model::Generator::AVAILABLE {
+            ui.label("Generative fill is unavailable in this build.");
+            return;
+        }
+        ui.label(if cfg!(target_os = "macos") {
+            "Uses your Mac's GPU when available, otherwise CPU."
+        } else {
+            "Uses the CPU. Generation can take several minutes."
+        });
+        let download = app.session.generator.download_status();
+        let installed = app.session.generator.installed();
+        if !installed {
+            ui.label("One-time setup: download the SD 1.5 inpainting model (about 2.2 GB). Lightcraft manages inference; no separate app is needed.");
+            ui.hyperlink_to("Read the model licence", lightcraft_engine::generative_model::LICENSE_URL);
+            let r = ui.checkbox(&mut app.ui.generative_model_ack, "I accept the CreativeML OpenRAIL-M model licence");
+            register(ui.ctx(), "checkbox:generativeModelConsent", r.rect);
+            let r = ui.add_enabled(!download.running && app.ui.generative_model_ack, egui::Button::new("Download model"));
+            register(ui.ctx(), "button:generativeDownloadModel", r.rect);
+            if r.clicked()
+                && let Err(e) = app.run("generative.model.download", json!({"acknowledged": true}))
+            {
+                app.toast_error(ui.ctx(), e);
+            }
+            if let Some(dir) = &app.session.generator.dir {
+                ui.label(format!("Model folder: {}", dir.display()));
+            }
+        }
+        if download.running {
+            let ratio = if download.total > 0 { (download.done as f64 / download.total as f64).clamp(0.0, 1.0) as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(ratio).text(format!("Downloading model: {:.0}%", ratio * 100.0)));
+            if !download.file.is_empty() {
+                ui.label(&download.file);
+            }
+            let r = ui.button("Cancel download");
+            register(ui.ctx(), "button:generativeCancelDownload", r.rect);
+            if r.clicked() {
+                let _ = app.run("generative.model.cancel", json!({}));
+            }
+        }
+        if let Some(error) = &download.error {
+            ui.label(format!("Model setup: {error}"));
+        }
         ui.label("Replacement prompt (optional)");
         let r = ui.text_edit_singleline(&mut app.ui.generative_prompt);
         register(ui.ctx(), "field:generativePrompt", r.rect);
@@ -379,15 +415,25 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         let running = app.tasks.is_running(LABEL);
         let (fill_clicked, remove_clicked) = ui
             .horizontal(|ui| {
-                let fill = ui.add_enabled(selected.is_some() && !running, egui::Button::new("Fill"));
+                let fill = ui.add_enabled(installed && selected.is_some() && !running, egui::Button::new("Fill"));
                 register(ui.ctx(), "button:generativeFill", fill.rect);
-                let remove = ui.add_enabled(selected.is_some() && !running, egui::Button::new("Remove"));
+                let remove = ui.add_enabled(installed && selected.is_some() && !running, egui::Button::new("Remove"));
                 register(ui.ctx(), "button:generativeRemove", remove.rect);
                 (fill.clicked(), remove.clicked())
             })
             .inner;
         if running {
-            ui.label("Generating…");
+            let (step, total) = app.session.generator.generation_progress();
+            if total > 1 {
+                ui.add(egui::ProgressBar::new(step as f32 / total as f32).text(format!("Generating: step {step} of {total}")));
+            } else {
+                ui.label("Preparing the local model and image…");
+            }
+            let r = ui.button("Cancel generation");
+            register(ui.ctx(), "button:generativeCancel", r.rect);
+            if r.clicked() {
+                let _ = app.run("photo.generativeCancel", json!({}));
+            }
         }
         if fill_clicked || remove_clicked {
             let Some(mask) = selected else { return };
@@ -397,24 +443,27 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 (app.ui.generative_prompt.clone(), app.ui.generative_negative.clone())
             };
             let opts = lightcraft_engine::generative::Options {
-                endpoint: app.ui.generative_endpoint.clone(),
-                checkpoint: app.ui.generative_checkpoint.clone(),
+                backend: lightcraft_engine::generative::Backend::Native,
+                endpoint: String::new(),
+                checkpoint: String::new(),
                 prompt,
                 negative,
                 steps: 24,
+                guidance: 7.5,
                 denoise: 1.0,
                 seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                edge: 1024,
+                edge: 512,
             };
             let demo_dir = (!app.ui.generative_demo_dir.trim().is_empty()).then_some(app.ui.generative_demo_dir.as_str());
             match app.session.plan_generative(id, mask, opts, demo_dir) {
                 Ok(job) => {
+                    let signals = app.session.generator.generation_signals();
                     let source_photo = app.session.catalog.photo(id).cloned();
                     let source_library = app.session.library.as_ref().map(|l| (l.dir.clone(), l.on_disk));
                     if let Err(e) = crate::tasks::spawn(
                         app,
                         LABEL,
-                        move || job.run(),
+                        move || job.run_with(&signals.cancel, |step, total| signals.progress.update(step, total)),
                         move |app, ctx, result| {
                             match result {
                             Ok(path) if source_photo.as_ref().is_none_or(|source| {

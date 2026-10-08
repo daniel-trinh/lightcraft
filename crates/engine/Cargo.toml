@@ -32,9 +32,13 @@ log = { workspace = true }
 ab_glyph = { workspace = true }
 lightcraft-segment = { workspace = true, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lightcraft-inpaint = { workspace = true, optional = true }
+
 [features]
 # AI masks with SAM 3 (Object / Describe). Off for the web and CLI builds.
 sam = ["dep:lightcraft-segment"]
+inpaint = ["dep:lightcraft-inpaint"]
 
 [dev-dependencies]
 libc = { workspace = true }
