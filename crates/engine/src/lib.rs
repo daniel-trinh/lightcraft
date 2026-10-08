@@ -21,6 +21,7 @@ pub mod devices;
 pub mod export;
 pub mod files;
 pub mod fonts;
+pub mod generative;
 pub mod guard;
 pub mod import;
 mod import_move;

@@ -327,6 +327,12 @@ pub struct UiState {
     pub remove_size: f32,
     pub remove_feather: f32,
     pub remove_opacity: f32,
+    /// Optional local ComfyUI inpainting connection and prompt for Generative Fill.
+    pub generative_endpoint: String,
+    pub generative_checkpoint: String,
+    pub generative_prompt: String,
+    pub generative_negative: String,
+    pub generative_demo_dir: String,
     /// Selected Point Color sample.
     pub point_color: usize,
     /// Point Color "Visualize range": the selected sample's range in colour, the rest grey.
@@ -603,6 +609,11 @@ impl Default for UiState {
             remove_size: 0.02,
             remove_feather: 50.0,
             remove_opacity: 100.0,
+            generative_endpoint: "http://127.0.0.1:8188".into(),
+            generative_checkpoint: String::new(),
+            generative_prompt: String::new(),
+            generative_negative: String::new(),
+            generative_demo_dir: String::new(),
             point_color: 0,
             point_color_visualize: false,
             eye: 0,

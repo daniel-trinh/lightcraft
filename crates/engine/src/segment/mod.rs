@@ -61,7 +61,7 @@ pub(crate) enum Tag {
     /// Object clicks on component `comp` of mask `mask`.
     Clicks { photo: PhotoId, mask: u32, comp: usize, hint: Vec<Point>, exclude: Vec<Point> },
     /// A Describe selection: a new mask (`mask: None`) or a component combined by `op`.
-    NewPrompt { photo: PhotoId, mask: Option<u32>, op: String, name: Option<String>, text: String },
+    NewPrompt { photo: PhotoId, mask: Option<u32>, op: String, name: Option<String>, text: String, invert: bool },
     /// A zoomed-in pass for a component, computed from `shape` (without its detail).
     Detail { photo: PhotoId, mask: u32, comp: usize, shape: MaskShape },
 }
@@ -499,7 +499,16 @@ impl Session {
 
     /// Background mode: queue a Describe selection; the mask (or component, combined by `op`
     /// into mask `mask`) is created by [`Session::segment_poll`] when something matches.
-    pub(crate) fn segment_text_later(&mut self, id: PhotoId, mask: Option<u32>, op: &str, name: Option<String>, text: &str) -> Result<(), String> {
+    /// `invert` belongs to the stored component and must survive the worker round trip.
+    pub(crate) fn segment_text_later(
+        &mut self,
+        id: PhotoId,
+        mask: Option<u32>,
+        op: &str,
+        name: Option<String>,
+        text: &str,
+        invert: bool,
+    ) -> Result<(), String> {
         self.segmenter.model_dir()?;
         let text = text.trim();
         if text.is_empty() {
@@ -507,12 +516,12 @@ impl Session {
         }
         #[cfg(feature = "sam")]
         {
-            let tag = Tag::NewPrompt { photo: id, mask, op: op.to_string(), name, text: text.to_string() };
+            let tag = Tag::NewPrompt { photo: id, mask, op: op.to_string(), name, text: text.to_string(), invert };
             self.segment_queue(id, worker::Kind::Text(text.to_string()), tag, None)
         }
         #[cfg(not(feature = "sam"))]
         {
-            let _ = (id, mask, op, name);
+            let _ = (id, mask, op, name, invert);
             Err("AI masks are not available in this build".into())
         }
     }
@@ -619,7 +628,7 @@ impl Session {
                     Err(e) => polled.messages.push(e.to_string()),
                 }
             }
-            Tag::NewPrompt { photo, mask, op, name, text } => {
+            Tag::NewPrompt { photo, mask, op, name, text, invert } => {
                 let seg = match o.result {
                     Ok(Some(seg)) => seg,
                     Ok(None) => return polled.messages.push(format!("Nothing matching “{text}” was found in this photo.")),
@@ -629,7 +638,7 @@ impl Session {
                     return polled.messages.push(format!("The photo changed before “{text}” was found; try again."));
                 }
                 let Ok(seg) = serde_json::to_value(seg) else { return };
-                let mut p = serde_json::json!({"kind": "prompt", "text": text, "seg": seg});
+                let mut p = serde_json::json!({"kind": "prompt", "text": text, "seg": seg, "invert": invert});
                 if let Some(n) = name {
                     p["name"] = serde_json::json!(n);
                 }
@@ -680,6 +689,30 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sam")]
+    #[test]
+    fn background_prompt_keeps_inversion_in_one_undo_step() {
+        let mut s = Session::with_demo();
+        let photo = s.active().unwrap();
+        let before = s.undo.len();
+        let mut polled = Polled::default();
+        s.apply_outcome(
+            worker::Outcome {
+                tag: Tag::NewPrompt { photo, mask: None, op: "add".into(), name: Some("AI Background".into()), text: "dog".into(), invert: true },
+                result: Ok(Some(SegMask::from_logits(4, &[5.0; 16]))),
+                superseded: false,
+            },
+            &mut polled,
+        );
+        assert!(polled.changed && polled.messages.is_empty());
+        let d = s.develop_of(photo).unwrap();
+        assert_eq!(d.masks[0].name, "AI Background");
+        assert!(d.masks[0].components[0].invert);
+        assert_eq!(s.undo.len(), before + 1);
+        s.execute("edit.undo", &serde_json::json!({})).unwrap();
+        assert!(s.develop_of(photo).unwrap().masks.is_empty());
+    }
 
     fn seg_box(side: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> SegMask {
         let l: Vec<f32> =

@@ -677,3 +677,26 @@ fn ai_masks_without_the_model_offer_the_download() {
     assert!(develop(&h).masks.is_empty());
     assert!(t.elapsed() < SETTLE, "{:?}", t.elapsed());
 }
+
+#[test]
+fn ai_preset_buttons_require_a_model_and_keep_the_requested_kind() {
+    use crate::state::Dialog;
+    use lightcraft_engine::segment::Segmenter;
+    let mut h = detail("panel.masking");
+    let dir = std::env::temp_dir().join(format!("lc-ui-ai-presets-{}", std::process::id()));
+    h.app.session.segmenter.dir = Some(dir.clone());
+    h.app.session.segmenter.mirrors_file = Some(dir.join("none.txt"));
+    for kind in ["aiSky", "aiSubject", "aiBackground", "aiPeople"] {
+        let r = h.request("ui.clickWidget", json!({"id": format!("button:maskNew:{kind}")}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(develop(&h).masks.is_empty());
+        assert!(!h.app.session.segmenter.download_status().running);
+        if Segmenter::AVAILABLE {
+            assert_eq!(h.app.ui.dialog, Some(Dialog::SamModel { then: Some((kind.into(), "new".into())), error: None }));
+            h.app.ui.dialog = None;
+            h.step();
+        } else {
+            assert_eq!(h.app.ui.dialog, None);
+        }
+    }
+}

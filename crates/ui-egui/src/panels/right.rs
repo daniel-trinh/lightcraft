@@ -342,6 +342,100 @@ fn remove(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             }
         }
     });
+    #[cfg(not(target_arch = "wasm32"))]
+    generative_fill(app, ui, id);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
+    const LABEL: &str = "Generative Fill";
+    divider(ui);
+    header(ui, "Generative Fill (local ComfyUI)");
+    padded(ui, |ui| {
+        ui.label("Select a mask in Masking. Fill replaces it using your prompt; Remove reconstructs its background. Each result is a new photo.");
+        ui.label("Generated copies have an edge of at most 1024 px in the desktop app.");
+        ui.label("ComfyUI URL");
+        let r = ui.text_edit_singleline(&mut app.ui.generative_endpoint);
+        register(ui.ctx(), "field:generativeEndpoint", r.rect);
+        ui.label("Installed inpainting checkpoint filename");
+        let r = ui.text_edit_singleline(&mut app.ui.generative_checkpoint);
+        register(ui.ctx(), "field:generativeCheckpoint", r.rect);
+        ui.label("Replacement prompt (optional)");
+        let r = ui.text_edit_singleline(&mut app.ui.generative_prompt);
+        register(ui.ctx(), "field:generativePrompt", r.rect);
+        ui.label("Negative prompt (optional)");
+        let r = ui.text_edit_singleline(&mut app.ui.generative_negative);
+        register(ui.ctx(), "field:generativeNegative", r.rect);
+        if app.session.catalog.photo(id).is_some_and(|p| matches!(&p.source, lightcraft_catalog::Source::Demo { .. })) {
+            ui.label("Output folder for demo photo");
+            let r = ui.text_edit_singleline(&mut app.ui.generative_demo_dir);
+            register(ui.ctx(), "field:generativeDemoDir", r.rect);
+        }
+        let selected = app.session.active_mask;
+        ui.label(match selected {
+            Some(n) => format!("Selected mask: {n}"),
+            None => "Select a mask first".into(),
+        });
+        let running = app.tasks.is_running(LABEL);
+        let (fill_clicked, remove_clicked) = ui
+            .horizontal(|ui| {
+                let fill = ui.add_enabled(selected.is_some() && !running, egui::Button::new("Fill"));
+                register(ui.ctx(), "button:generativeFill", fill.rect);
+                let remove = ui.add_enabled(selected.is_some() && !running, egui::Button::new("Remove"));
+                register(ui.ctx(), "button:generativeRemove", remove.rect);
+                (fill.clicked(), remove.clicked())
+            })
+            .inner;
+        if running {
+            ui.label("Generating…");
+        }
+        if fill_clicked || remove_clicked {
+            let Some(mask) = selected else { return };
+            let (prompt, negative) = if remove_clicked {
+                lightcraft_engine::generative::removal_prompts(&app.ui.generative_negative)
+            } else {
+                (app.ui.generative_prompt.clone(), app.ui.generative_negative.clone())
+            };
+            let opts = lightcraft_engine::generative::Options {
+                endpoint: app.ui.generative_endpoint.clone(),
+                checkpoint: app.ui.generative_checkpoint.clone(),
+                prompt,
+                negative,
+                steps: 24,
+                denoise: 1.0,
+                seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                edge: 1024,
+            };
+            let demo_dir = (!app.ui.generative_demo_dir.trim().is_empty()).then_some(app.ui.generative_demo_dir.as_str());
+            match app.session.plan_generative(id, mask, opts, demo_dir) {
+                Ok(job) => {
+                    let source_photo = app.session.catalog.photo(id).cloned();
+                    let source_library = app.session.library.as_ref().map(|l| (l.dir.clone(), l.on_disk));
+                    if let Err(e) = crate::tasks::spawn(
+                        app,
+                        LABEL,
+                        move || job.run(),
+                        move |app, ctx, result| {
+                            match result {
+                            Ok(path) if source_photo.as_ref().is_none_or(|source| {
+                                app.session.library.as_ref().map(|l| (l.dir.clone(), l.on_disk)) != source_library
+                                    || !app.session.catalog.photo(id).is_some_and(|current| std::sync::Arc::ptr_eq(current, source))
+                            }) => app.toast_error(ctx, format!("The source photo or library changed while generating. The result is saved at {} and can be imported manually.", path.display())),
+                            Ok(path) => match app.run("photo.generativeImport", json!({"original": id.0, "path": path.to_string_lossy()})) {
+                                Ok(_) => app.toast(ctx, "Generated photo added to the library"),
+                                Err(e) => app.toast_error(ctx, e),
+                            },
+                            Err(e) => app.toast_error(ctx, e),
+                        }
+                        },
+                    ) {
+                        app.toast_error(ui.ctx(), e);
+                    }
+                }
+                Err(e) => app.toast_error(ui.ctx(), e),
+            }
+        }
+    });
 }
 
 fn red_eye(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {

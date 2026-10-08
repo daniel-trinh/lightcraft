@@ -76,6 +76,22 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 0, bottom: 10 }).show(ui, |ui| {
         ui.label(egui::RichText::new(crate::i18n::tr("Create New Mask")).color(t.text_dim));
         ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            for (kind, label) in [("aiSky", "AI Sky"), ("aiSubject", "AI Subject"), ("aiBackground", "AI Background"), ("aiPeople", "AI People")] {
+                if text_button(ui, &format!("maskNew:{kind}"), label, false).clicked()
+                    && !needs_model(app, kind, "new")
+                    && let Err(e) = begin_ai(app, kind, "new")
+                {
+                    app.ai_error(ui.ctx(), e, Some((kind, "new")));
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new("AI uses the local SAM 3 model. Subject/background can be refined with Describe or Object.")
+                .small()
+                .color(t.text_dim),
+        );
+        ui.add_space(6.0);
         let tiles: [(&str, &str, Icon); 10] = [
             ("object", "Object", Icon::Subject),
             ("prompt", "Describe", Icon::Subject),
@@ -97,6 +113,11 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 ui.painter().rect_filled(r, 4.0, if resp.hovered() { t.hover } else { t.inset });
                 paint(ui.painter(), Rect::from_center_size(r.center() - vec2(0.0, 7.0), vec2(20.0, 20.0)), *icon, t.text_label);
                 ui.painter().text(pos2(r.center().x, r.bottom() - 9.0), Align2::CENTER_CENTER, *label, t.font(10.5), t.text_dim);
+                let resp = if matches!(*kind, "subject" | "sky" | "background") {
+                    resp.on_hover_text("Fast image-processing selection. Use the AI buttons for model-based selection.")
+                } else {
+                    resp
+                };
                 if resp.clicked() {
                     match *kind {
                         "colorRange" => {
@@ -667,6 +688,19 @@ pub(crate) fn start_object(app: &mut LightcraftApp, ctx: &egui::Context, op: &st
 /// after the model was installed.
 pub(crate) fn begin_ai(app: &mut LightcraftApp, kind: &str, op: &str) -> Result<serde_json::Value, String> {
     match kind {
+        "aiSky" | "aiSubject" | "aiBackground" | "aiPeople" => {
+            let name = match kind {
+                "aiSky" => "AI Sky",
+                "aiSubject" => "AI Subject",
+                "aiBackground" => "AI Background",
+                _ => "AI People",
+            };
+            if op == "new" {
+                app.run("mask.add", json!({"kind": kind, "name": name}))
+            } else {
+                app.run("mask.addComponent", json!({"op": op, "kind": kind}))
+            }
+        }
         "object" => {
             let r = if op == "new" {
                 app.run("mask.add", json!({"kind": "object"}))
@@ -740,6 +774,16 @@ fn describe_field(app: &mut LightcraftApp, ui: &mut egui::Ui, new_mask: bool) {
 }
 
 fn component_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, op: &str) {
+    for (kind, label) in [("aiSky", "AI Sky"), ("aiSubject", "AI Subject"), ("aiBackground", "AI Background"), ("aiPeople", "AI People")] {
+        let b = ui.button(label);
+        register(ui.ctx(), format!("maskComp:{op}:{kind}"), b.rect);
+        if b.clicked()
+            && !needs_model(app, kind, op)
+            && let Err(e) = begin_ai(app, kind, op)
+        {
+            app.ai_error(ui.ctx(), e, Some((kind, op)));
+        }
+    }
     let b = ui.button(crate::i18n::tr("Object"));
     register(ui.ctx(), format!("maskComp:{op}:object"), b.rect);
     if b.clicked() {

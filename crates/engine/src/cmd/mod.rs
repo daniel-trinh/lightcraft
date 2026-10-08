@@ -14,6 +14,7 @@ mod develop;
 mod edit;
 mod export;
 pub mod filters;
+mod generative;
 pub mod keywords;
 pub mod library;
 pub mod lut_profiles;
@@ -135,6 +136,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(preset_files::specs());
         v.extend(prefs::specs());
         v.extend(export::specs());
+        v.extend(generative::specs());
         v.extend(before::specs());
         v.extend(browse::specs());
         v.extend(missing::specs());

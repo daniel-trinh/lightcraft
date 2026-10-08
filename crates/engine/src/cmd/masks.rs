@@ -40,16 +40,36 @@ fn shape_from(kind: &str, p: &Value, c: &str) -> Result<MaskShape> {
             MaskShape::ColorRange { samples, refine: f64_or(p, "refine", 50.0) }
         }
         "object" => MaskShape::Object { hint: points(p, "points"), exclude: points(p, "exclude"), seg: seg_param(p), detail: vec![], edge: 0.0 },
-        "prompt" => {
-            MaskShape::Prompt { text: str_param(p, "text").unwrap_or_default().trim().to_string(), seg: seg_param(p), detail: vec![], edge: 0.0 }
+        "prompt" | "aiSky" | "aiSubject" | "aiBackground" | "aiPeople" => {
+            let default = match kind {
+                "aiSky" => "sky",
+                "aiPeople" => "person",
+                "aiSubject" | "aiBackground" => "main subject",
+                _ => "",
+            };
+            let text = str_param(p, "text").unwrap_or(default).trim().to_string();
+            if text.is_empty() {
+                return Err(bad(c, "describe what to select"));
+            }
+            MaskShape::Prompt { text, seg: seg_param(p), detail: vec![], edge: 0.0 }
         }
         other => {
             return Err(bad(
                 c,
-                format!("unknown mask kind `{other}` (brush|linear|radial|sky|subject|background|luminanceRange|colorRange|object|prompt)"),
+                format!(
+                    "unknown mask kind `{other}` (brush|linear|radial|sky|subject|background|luminanceRange|colorRange|object|prompt|aiSky|aiSubject|aiBackground|aiPeople)"
+                ),
             ));
         }
     })
+}
+
+/// AI background selects the complement of the described subject. An explicit invert
+/// toggles that complement, just as it does for any other component.
+fn component_invert(kind: &str, p: &Value) -> bool {
+    // Radial gradients already store their inversion in the shape. Applying it to
+    // the component as well would cancel it out.
+    kind != "radial" && ((kind == "aiBackground") ^ bool_or(p, "invert", false))
 }
 
 /// `[[x, y], …]` normalized points under `key`.
@@ -158,16 +178,17 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create New Mask",
             [],
             None,
-            "{kind: brush|linear|radial|sky|subject|background|luminanceRange|colorRange|object|prompt, ...shape params (start/end, center/rx/ry/angle/feather, lo/hi…; object: points/exclude [[x,y],…]; prompt: text; object/prompt: seg? a stored segmentation, no model needed), name?} — AI kinds need the SAM 3 model; in the app a prompt returns {pending} and the mask appears when found",
+            "{kind: brush|linear|radial|sky|subject|background|luminanceRange|colorRange|object|prompt|aiSky|aiSubject|aiBackground|aiPeople, ...shape params, text?, seg?, invert?, name?} — AI presets use SAM 3 (sky/person/main subject or supplied text); aiBackground inverts the described subject. Stored seg needs no model. In the app AI returns {pending} and the mask appears when found",
             has_active,
             |s, p| {
                 let kind = str_param(p, "kind").unwrap_or("radial").to_string();
+                let invert = component_invert(&kind, p);
                 let mut shape = shape_from(&kind, p, "mask.add")?;
                 let later = resolve_ai(s, &mut shape, "mask.add")?;
                 let name = str_param(p, "name").map(str::to_string);
                 if let Later::Text(text) = &later {
                     let id = s.active().ok_or_else(|| bad("mask.add", "no active photo"))?;
-                    s.segment_text_later(id, None, "add", name, text).map_err(ai_err)?;
+                    s.segment_text_later(id, None, "add", name, text, invert).map_err(ai_err)?;
                     return Ok(json!({"pending": true}));
                 }
                 let next = s.active().and_then(|id| s.develop_of(id)).map(|d| d.next_mask_id()).unwrap_or(1);
@@ -175,7 +196,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     masks.push(Mask {
                         id: next,
                         name: name.unwrap_or_else(|| format!("Mask {next}")),
-                        components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape }],
+                        components: vec![MaskComponent { name: None, op: MaskOp::Add, invert, shape }],
                         ..Default::default()
                     });
                     *active = Some(next);
@@ -193,6 +214,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_active,
             |s, p| {
                 let kind = str_param(p, "kind").unwrap_or("brush").to_string();
+                let invert = component_invert(&kind, p);
                 let op: MaskOp =
                     serde_json::from_value(p.get("op").cloned().unwrap_or(json!("add"))).map_err(|e| bad("mask.addComponent", e.to_string()))?;
                 let active = s.active_mask;
@@ -205,13 +227,13 @@ pub fn specs() -> Vec<CommandSpec> {
                 let later = resolve_ai(s, &mut shape, "mask.addComponent")?;
                 if let Later::Text(text) = &later {
                     let op = p.get("op").and_then(Value::as_str).unwrap_or("add");
-                    s.segment_text_later(id, Some(mid), op, None, text).map_err(ai_err)?;
+                    s.segment_text_later(id, Some(mid), op, None, text, invert).map_err(ai_err)?;
                     return Ok(json!({"pending": true}));
                 }
                 let mut comp = 0;
                 let out = masks_edit(s, "mask.addComponent", "Edit Mask", |masks, _| {
                     let i = find(masks, mid, "mask.addComponent")?;
-                    masks[i].components.push(MaskComponent { name: None, op, invert: bool_or(p, "invert", false), shape });
+                    masks[i].components.push(MaskComponent { name: None, op, invert, shape });
                     comp = masks[i].components.len() - 1;
                     Ok(())
                 })?;

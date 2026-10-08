@@ -12,6 +12,15 @@ below) works, and no render, export or command ever waits for it.
 
 In the Masking panel (M):
 
+- **AI Sky / AI People:** one-click SAM 3 text selections for `sky` and `person`.
+- **AI Subject / AI Background:** select `main subject`, or its complement. These are text
+  prompts, so ambiguous photos may need a more specific description or Object clicks.
+  Scripts can supply `text`, e.g. `mask.add {"kind":"aiBackground", "text":"dog"}`.
+  Background inversion is stored with the component, including background worker results,
+  and works with Add / Subtract / Intersect. A failed or empty selection never creates an
+  all-image background mask. The existing Subject / Sky / Background tiles remain the fast
+  classical selections and do not require a model.
+
 - **Object**: click the thing you want; every click refines the selection. ⌥-click (Alt) a part
   to leave it out. Clicks show as green (include) and red (leave out) dots.
 - **Describe**: type what to select — `sky`, `trees`, `the red car` — and press Return. Every
@@ -144,6 +153,7 @@ Therefore:
 |---|---|---|
 | `mask.add` | `{kind: "object", points?: [[x,y],…], exclude?: [[x,y],…], seg?}` | an Object mask (empty until clicked) |
 | `mask.add` | `{kind: "prompt", text, seg?}` | a Describe mask |
+| `mask.add` | `{kind: "aiSky"\|"aiPeople"\|"aiSubject"\|"aiBackground", text?, seg?, invert?, name?}` | SAM 3 preset; background complements the selected subject; `invert` toggles it |
 | `mask.addComponent` | `{op: add\|subtract\|intersect, kind: "object"\|"prompt", …}` | the same as a component |
 | `mask.objectPoint` | `{x, y, exclude?: bool, id?}` | one click on the selected mask's Object selection (≤ 64 clicks) |
 | `mask.refineDetail` | `{id?, component?}` | the zoomed-in detail pass → `{started}` |

@@ -73,6 +73,53 @@ fn status_and_model_commands_without_the_model() {
     assert!(!s.segmenter.download_status().running);
 }
 
+#[test]
+fn ai_presets_replay_without_a_model_and_keep_background_inversion() {
+    use lightcraft_develop::{MaskOp, MaskShape, SegMask};
+    let mut s = Session::with_demo();
+    let id = s.active().unwrap();
+    let seg = serde_json::to_value(SegMask::from_logits(4, &[5.0; 16])).unwrap();
+    for (kind, text, invert) in
+        [("aiSky", "sky", false), ("aiPeople", "person", false), ("aiSubject", "main subject", false), ("aiBackground", "main subject", true)]
+    {
+        s.execute("mask.add", &json!({"kind": kind, "seg": seg})).unwrap();
+        let d = s.develop_of(id).unwrap();
+        let c = &d.masks.last().unwrap().components[0];
+        assert_eq!(c.invert, invert);
+        assert!(matches!(&c.shape, MaskShape::Prompt { text: t, seg: Some(_), .. } if t == text));
+    }
+    s.execute("mask.addComponent", &json!({"kind": "aiBackground", "text": "dog", "op": "intersect", "seg": seg})).unwrap();
+    let d = s.develop_of(id).unwrap();
+    let c = d.masks.last().unwrap().components.last().unwrap();
+    assert!(c.invert);
+    assert_eq!(c.op, MaskOp::Intersect);
+    assert!(matches!(&c.shape, MaskShape::Prompt { text, .. } if text == "dog"));
+    s.execute("mask.add", &json!({"kind": "aiBackground", "seg": seg, "invert": true})).unwrap();
+    assert!(!s.develop_of(id).unwrap().masks.last().unwrap().components[0].invert);
+    let before = s.develop_of(id).unwrap().masks.len();
+    assert!(s.execute("mask.add", &json!({"kind": "aiSky", "text": "   ", "seg": seg})).is_err());
+    assert_eq!(s.develop_of(id).unwrap().masks.len(), before);
+    s.execute("mask.add", &json!({"kind": "radial", "invert": true})).unwrap();
+    let d = s.develop_of(id).unwrap();
+    let c = &d.masks.last().unwrap().components[0];
+    assert!(!c.invert, "radial inversion must not be applied twice");
+    assert!(matches!(&c.shape, MaskShape::Radial { invert: true, .. }));
+}
+
+#[test]
+fn ai_presets_without_a_model_never_fall_back_to_heuristics() {
+    let mut s = Session::with_demo();
+    let id = s.active().unwrap();
+    s.segmenter.background = true;
+    for kind in ["aiSky", "aiSubject", "aiBackground", "aiPeople"] {
+        assert!(s.execute("mask.add", &json!({"kind": kind})).is_err());
+        assert!(s.develop_of(id).unwrap().masks.is_empty());
+    }
+    // The fast selections remain available independently.
+    s.execute("mask.add", &json!({"kind": "sky"})).unwrap();
+    assert_eq!(s.develop_of(id).unwrap().masks.len(), 1);
+}
+
 #[cfg(feature = "sam")]
 #[test]
 fn a_failing_download_ends_with_an_error_and_never_blocks() {

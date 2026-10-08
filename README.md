@@ -1,11 +1,6 @@
-<p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
-</p>
+> Experimental AI editing fork, based on LightCraft by the ArtCraft team. This fork is
+> independently maintained. [AI masking setup](docs/ai-masks.md) ·
+> [Local generative fill/remove setup](docs/generative-fill.md).
 
 
 <h1 align="center">LightCraft</h1>
@@ -289,7 +284,7 @@ LightCraft is young and moving fast. **Where we honestly stand** (details in the
 - **The biggest gaps:**
   - **camera colour calibration:** raws other than DNG develop with a neutral colour matrix today, so colour is muted;
   - **CR3 and compressed Fujifilm / Olympus raws:** these open as embedded previews only;
-  - **AI masks and denoise:** subject and sky selection are classical heuristics;
+  - **AI:** optional local SAM 3 masking presets and local ComfyUI generative fill/remove are experimental in this fork; model setup is required, and AI denoise is unfinished;
   - **HDR, video and the Classic Print / Book / Map modules.**
 - **What's next:** see [where we're going](ROADMAP.md#where-were-going).
 
@@ -298,7 +293,7 @@ LightCraft is young and moving fast. **Where we honestly stand** (details in the
 | Library: albums, folders, smart albums, stacks (incl. auto-stack), virtual copies, ratings, flags, labels, filter bar, search, sort, grids, filmstrip | ✅ |
 | Culling: Compare (synced zoom) and Survey views, auto-advance, instant previews | ✅ |
 | Light, Color, Effects (vignette styles), Tone Curve (+ refine saturation, targeted adjustment), Color Mixer (+ targeted), Point Color, Color Grading, Calibration, B&W | ✅ |
-| Masking: brush, linear, radial, luminance/colour range, add/subtract/intersect | ✅ (AI subject/sky use classical heuristics for now) |
+| Masking: brush, linear, radial, luminance/colour range, add/subtract/intersect | ✅ · optional SAM 3 AI presets 🟡 ([setup](docs/ai-masks.md)) |
 | Crop, straighten tool + auto straighten, flip, rotate, aspect ratios, overlays | ✅ |
 | Profiles (Color, Neutral, Vivid, Landscape, Portrait, Monochrome: our own looks), presets, versions, history, copy/paste/sync settings | ✅ |
 | Camera colour: DNG files use their own matrices | ✅ · our own calibration for other raws ⬜ (top priority; ARW, NEF and RW2 start from a look fitted to their own JPEG, other raws from a neutral fallback) |
@@ -314,7 +309,8 @@ LightCraft is young and moving fast. **Where we honestly stand** (details in the
 | Optics (distortion, vignetting, auto + manual CA, defringe, DNG-embedded lens corrections), Geometry (transforms, Constrain Crop), Upright (Auto/Level/Vertical/Full/Guided) | ✅ · camera lens profiles (our own) ⬜ |
 | Photo Merge: HDR (auto-align, deghost), Panorama (spherical/cylindrical/perspective, boundary warp, auto crop), HDR Panorama → DNG | ✅ |
 | GPU pipeline (wgpu compute, CPU-exact within 1/255), CPU fallback on device limits / errors | ✅ · WebGPU in the browser 🚧 |
-| AI: segmentation masks, AI denoise, super resolution, faces; HDR editing; video | ⬜ (see [roadmap](ROADMAP.md#where-were-going)) |
+| AI: segmentation masks, generative fill/remove | 🟡 · optional local models, experimental ([masking](docs/ai-masks.md), [generation](docs/generative-fill.md)) |
+| AI denoise, super resolution, faces; HDR editing; video | ⬜ (see [roadmap](ROADMAP.md#where-were-going)) |
 | Web build (same UI in the browser via WASM): persistent library in OPFS/IndexedDB, Web Worker rendering, export downloads | ✅ · WebGPU, Safari/Firefox testing 🚧 |
 
 <sub>✅ works today · 🚧 in progress · ⬜ not started</sub>
@@ -324,7 +320,7 @@ LightCraft is young and moving fast. **Where we honestly stand** (details in the
 ## Quick start
 
 ```sh
-git clone https://github.com/storytold/lightcraft && cd lightcraft
+git clone --branch ai-masking-fill https://github.com/daniel-trinh/lightcraft && cd lightcraft
 cargo run --release -p lightcraft                       # opens your library (~/Pictures/LightCraft Library; a new one starts with demo photos)
 cargo run --release -p lightcraft -- ~/Pictures/trip    # import your photos (folders are scanned, duplicates skipped)
 cargo run --release -p lightcraft -- --memory           # a throwaway in-memory demo session (writes nothing)
@@ -471,17 +467,11 @@ Inter (SIL OFL 1.1). Builds made with [craft-fonts](https://github.com/storytold
 also embed its Chinese and Japanese fonts (Noto Sans CJK SC, BIZ UDPGothic, BIZ UDMincho, Shippori Mincho; SIL OFL 1.1), listed in its
 [ATTRIBUTION.md](https://github.com/storytold/craft-fonts/blob/main/ATTRIBUTION.md). All icons are original.
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and LightCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+The ArtCraft name, wordmark and logos are trademarks of the ArtCraft Team. Brand artwork has
+been removed from this fork as required by [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
 
 <sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. LightCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
 
-<p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
-</p>
 
 ## Star history
 
