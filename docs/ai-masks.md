@@ -1,8 +1,9 @@
 # AI masks (Object and Describe)
 
 LightCraft selects objects with **SAM 3** (Segment Anything with Concepts, Meta 2025), run in
-pure Rust by `crates/segment` on [candle](https://github.com/huggingface/candle): on the GPU
-through Metal on macOS, on the CPU elsewhere (for now).
+`crates/segment` on [candle](https://github.com/huggingface/candle): Metal on macOS,
+NVIDIA CUDA in an optional `cuda` build, and CPU otherwise. The CUDA build uses NVIDIA
+runtime libraries; those are bundled in the Windows portable package.
 
 **The model is optional.** It is not part of LightCraft, and nothing requires it: without it,
 Object and Describe offer to download it, every other feature (and every existing mask, see
@@ -53,11 +54,38 @@ renders them. Editing the photo's look later does not recompute a mask (click ag
 
 ## Getting the model
 
-### In the app (recommended)
+### Why SAM 3 for photos rather than SAM 3.1?
+
+SAM 3.1 primarily adds Object Multiplex for more efficient multi-object video tracking.
+Meta's current `build_sam3_image_model` still explicitly downloads the `sam3` checkpoint;
+the multiplex video builders download `sam3.1`. This photo editor uses the image model.
+The SAM 3.1 `sam3.1_multiplex.pt` file is not a replacement for the `model.safetensors`
+checkpoint expected by this Rust implementation. Both official repositories have access gates.
+See [Meta's model builders](https://github.com/facebookresearch/sam3/blob/main/sam3/model_builder.py)
+and [SAM 3.1 release notes](https://github.com/facebookresearch/sam3/blob/main/RELEASE_SAM3p1.md).
+
+### Use your approved local model folder (recommended)
+
+Request access at [Meta's SAM 3 repository](https://huggingface.co/facebook/sam3). Meta
+reviews access requests; LightCraft cannot approve them. Once approved, download
+`model.safetensors`, `vocab.json`, and `merges.txt` into one folder. The `.pt` and SAM 3.1
+multiplex checkpoints are not replacements for these files.
+
+In Masking, open **AI Model Setup…**, then **Choose Model Folder…** and select that folder.
+The app checks the required files and remembers the location across restarts. File selection
+does not download anything or submit your photos. The checkpoint is parsed when first used;
+corrupt or incompatible files report a loading error. Reopen AI Model Setup to change the
+folder. The same operation is available as `segment.model.useDirectory {"dir":"..."}`.
+
+At startup, `LIGHTCRAFT_SAM3_DIR` takes precedence over the saved folder, which takes
+precedence over the default settings-folder location. Setting up the model does not accept
+Meta's terms or request repository access on your behalf.
+
+### App-managed download from a configured location
 
 The first time you pick Object or Describe without the model, LightCraft asks:
 
-> **Download the SAM 3 model?** Object and Describe masks use SAM 3, Meta's segmentation model.
+> **AI Mask Model** Object and Describe masks use SAM 3, Meta's segmentation model.
 > It isn't part of LightCraft, and everything else works without it. Download it once (about
 > 3.4 GB) · *folder*. Licence: SAM License (Meta) — Meta's terms, not LightCraft's. Downloading
 > it means accepting them. [Read the SAM License] — **Not Now** / **Download**

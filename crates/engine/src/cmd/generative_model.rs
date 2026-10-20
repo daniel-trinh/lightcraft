@@ -14,7 +14,7 @@ fn status(s: &mut Session, _: &Value) -> Result<Value> {
         "download": s.generator.download_status(),
         "license": LICENSE_NAME,
         "licenseUrl": LICENSE_URL,
-        "device": if cfg!(target_os="macos") { "Metal when available, otherwise CPU" } else { "CPU" },
+        "device": crate::generative_model::backend_description(),
     }))
 }
 

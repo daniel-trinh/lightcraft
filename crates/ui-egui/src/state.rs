@@ -135,6 +135,8 @@ impl InfoOverlay {
 pub struct AppSettings {
     /// Library opened at launch when no `--library` is given (empty = the default location).
     pub library_path: String,
+    /// Optional locally selected SAM 3 model folder; empty uses the default config folder.
+    pub sam_model_dir: String,
     pub startup_view: StartupView,
     /// Ask before moving photos to Recently Deleted (keyboard and menu).
     pub confirm_delete: bool,
@@ -158,6 +160,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             library_path: String::new(),
+            sam_model_dir: String::new(),
             startup_view: StartupView::Last,
             confirm_delete: false,
             gpu: true,
@@ -168,6 +171,17 @@ impl Default for AppSettings {
             film_badges: true,
             grid_badges: GridBadges::Auto,
         }
+    }
+}
+
+#[cfg(test)]
+mod app_settings_tests {
+    use super::AppSettings;
+
+    #[test]
+    fn app_settings_without_model_directory_deserialize_to_default() {
+        let settings: AppSettings = serde_json::from_str("{}").expect("defaulted settings");
+        assert!(settings.sam_model_dir.is_empty());
     }
 }
 

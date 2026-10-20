@@ -53,6 +53,11 @@ of it. Full standard: `../craftrules/standards/never-crash.md`
 ## Non-negotiables
 - **Clean-room.** Never read/disassemble anything inside Adobe app bundles (names/listings only). Never copy Adobe icons, presets, profiles (DCP), lens profiles (LCP), camera matrices, fonts. Observation of the installed Lightroom is read-only (it syncs the user's personal library: never import/edit/rate/delete there). Never copy GPL/LGPL/AGPL code (darktable, RawTherapee, ART, LibRaw, rawspeed, rawloader, rawler, lensfun, dcraw-derived GPL code…).
 - **Pure Rust** in the product. No C/C++ dependencies.
+  Fork exception for the requested NVIDIA GPU release: the optional `cuda` feature may use
+  Candle's CUDA kernels and NVIDIA's CUDA runtime libraries. Keep these dependencies confined
+  to AI inference and include their redistribution licences in the portable package. The app
+  must not require Python, ComfyUI, a separate service, or a user-installed CUDA toolkit.
+  CPU/web builds retain the pure-Rust dependency policy; all other rules remain in force.
 - **Layering** (`plan/architecture.md` §3, enforced by `cargo xtask layers`): nothing below L5 depends on egui/eframe/winit/rfd.
 - **Everything is a command** (`crates/engine`): id, label, menu path, shortcut, params, enabled(), run(). UI, CLI, control channel and MCP all dispatch by id. Every slider is a `develop` control spec.
 - **Resolution independence:** settings use normalized image coordinates and relative radii; previews and exports must match.

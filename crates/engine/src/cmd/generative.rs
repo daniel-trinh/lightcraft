@@ -7,17 +7,22 @@ use std::io::Read;
 use super::{CommandSpec, bad, cmd, has_active};
 use crate::{
     Result, Session,
-    generative::{Backend, Options},
+    generative::{Backend, Options, REMOVE_MASK_MARGIN},
 };
 
-pub fn options(p: &Value) -> Result<Options> {
-    const C: &str = "photo.generativeFill";
+fn options_for(p: &Value, remove: bool) -> Result<Options> {
+    let c = if remove { "photo.generativeRemove" } else { "photo.generativeFill" };
     let backend = match p.get("backend").and_then(Value::as_str) {
         Some("native") => Backend::Native,
         Some("comfy") => Backend::Comfy,
-        Some(value) => return Err(bad(C, format!("unknown backend '{value}'; choose native or comfy"))),
+        Some(value) => return Err(bad(c, format!("unknown backend '{value}'; choose native or comfy"))),
         None if p.get("endpoint").is_some() || p.get("checkpoint").is_some() => Backend::Comfy,
         None => Backend::Native,
+    };
+    let mask_margin = match p.get("maskMargin") {
+        Some(value) => value.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad(c, "maskMargin must be an integer from 0 to 64"))?,
+        None if remove && backend == Backend::Native => REMOVE_MASK_MARGIN,
+        None => 0,
     };
     let o = Options {
         backend,
@@ -27,7 +32,7 @@ pub fn options(p: &Value) -> Result<Options> {
         negative: p.get("negative").and_then(Value::as_str).unwrap_or_default().to_string(),
         steps: p.get("steps").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(24),
         guidance: p.get("guidance").and_then(Value::as_f64).unwrap_or(7.5),
-        denoise: p.get("denoise").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+        denoise: p.get("denoise").and_then(Value::as_f64).unwrap_or(if backend == Backend::Native { 0.99 } else { 1.0 }),
         seed: p
             .get("seed")
             .and_then(Value::as_u64)
@@ -36,13 +41,15 @@ pub fn options(p: &Value) -> Result<Options> {
             Backend::Native => 512,
             Backend::Comfy => 1024,
         }),
+        mask_margin,
     };
-    o.validate().map_err(|e| bad(C, e))?;
+    o.validate().map_err(|e| bad(c, e))?;
     Ok(o)
 }
 
 pub fn import_generated(s: &mut Session, original: PhotoId, path: &str) -> Result<Value> {
     const C: &str = "photo.generativeImport";
+    const MAX_GENERATED_PNG_BYTES: u64 = 512 * 1024 * 1024;
     if s.catalog.photo(original).is_none() {
         return Err(bad(C, "original photo is no longer in the library"));
     }
@@ -52,10 +59,14 @@ pub fn import_generated(s: &mut Session, original: PhotoId, path: &str) -> Resul
     // Seed the import's probe cache: headless/demo sessions may have no FileProbe attached.
     // This also checks the durable output before a catalog record can refer to it.
     let file = std::fs::File::open(path).map_err(|e| bad(C, format!("{path}: {e}")))?;
+    let size = file.metadata().map_err(|e| bad(C, format!("{path}: {e}")))?.len();
+    if size > MAX_GENERATED_PNG_BYTES {
+        return Err(bad(C, "generated PNG exceeds the 512 MiB import limit"));
+    }
     let mut bytes = Vec::new();
-    file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| bad(C, format!("{path}: {e}")))?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err(bad(C, "generated file is too large"));
+    file.take(MAX_GENERATED_PNG_BYTES + 1).read_to_end(&mut bytes).map_err(|e| bad(C, format!("{path}: {e}")))?;
+    if bytes.len() as u64 > MAX_GENERATED_PNG_BYTES {
+        return Err(bad(C, "generated PNG exceeds the 512 MiB import limit"));
     }
     let info = crate::files::probe_bytes(path, &bytes).map_err(|e| bad(C, format!("generated file is invalid: {e}")))?;
     s.import_probes.insert(path.to_string(), info);
@@ -63,7 +74,7 @@ pub fn import_generated(s: &mut Session, original: PhotoId, path: &str) -> Resul
     let r = s.execute("library.import", &json!({"paths": [path]}))?;
     let id = r["imported"].get(0).and_then(Value::as_u64).ok_or_else(|| bad(C, format!("generated file was not imported: {r}")))?;
     let _ = s.execute("stack.group", &json!({"ids": [id, original.0], "top": id, "collapsed": false}));
-    s.merge_undo(s.undo.len().saturating_sub(undo_before), "Generative Fill");
+    s.merge_undo(s.undo.len().saturating_sub(undo_before), "Generative Edit");
     s.selection = crate::Selection::single(PhotoId(id));
     Ok(json!({"id": id, "path": path, "original": original.0}))
 }
@@ -72,7 +83,7 @@ fn run(s: &mut Session, p: &Value, remove: bool) -> Result<Value> {
     let c = if remove { "photo.generativeRemove" } else { "photo.generativeFill" };
     let id = s.active().ok_or_else(|| bad(c, "no active photo"))?;
     let mask = p.get("maskId").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad(c, "choose a maskId"))?;
-    let mut opts = options(p)?;
+    let mut opts = options_for(p, remove)?;
     if remove {
         (opts.prompt, opts.negative) = crate::generative::removal_prompts(&opts.negative);
     }
@@ -102,7 +113,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Generative Fill",
             [],
             None,
-            "{maskId, backend?: native|comfy (native default), prompt?: text (empty removes), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512, denoise?: 1 (native only supports 1), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — generate selected mask as a new PNG and library photo; original is retained → {id, path, original}",
+            "{maskId, backend?: native|comfy (native default), prompt?: text (empty removes), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512 (native model patch size; output stays full resolution), denoise?: 0.99 native|1 comfy, maskMargin?: 0..64 (native default 0), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — generate selected mask as a new PNG and library photo; original is retained → {id, path, original}",
             has_active,
             fill
         ),
@@ -111,7 +122,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Generative Remove",
             [],
             None,
-            "{maskId, backend?: native|comfy (native default), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512, denoise?: 1 (native only supports 1), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — remove the selected area using background-matching prompts, saving a separate PNG and library photo → {id, path, original}",
+            "{maskId, backend?: native|comfy (native default), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512 (native model patch size; output stays full resolution), denoise?: 0.99 native|1 comfy, maskMargin?: 0..64 (native default 32), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — remove the selected area using background-matching prompts, saving a separate PNG and library photo → {id, path, original}",
             has_active,
             remove
         ),
@@ -133,6 +144,22 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    #[test]
+    fn native_defaults_to_partial_denoise_and_comfy_keeps_full_strength() {
+        let native = options_for(&json!({}), false).unwrap();
+        assert_eq!(native.backend, Backend::Native);
+        assert!((native.denoise - 0.99).abs() < 0.0001);
+        assert_eq!(native.mask_margin, 0);
+        assert_eq!(options_for(&json!({}), true).unwrap().mask_margin, REMOVE_MASK_MARGIN);
+        assert_eq!(options_for(&json!({"maskMargin":0}), true).unwrap().mask_margin, 0);
+        let comfy = options_for(&json!({"backend":"comfy","checkpoint":"inpaint.safetensors"}), false).unwrap();
+        assert_eq!(comfy.denoise, 1.0);
+        assert_eq!(options_for(&json!({"backend":"comfy","checkpoint":"inpaint.safetensors"}), true).unwrap().mask_margin, 0);
+        assert!(options_for(&json!({"maskMargin":65}), false).is_err());
+        assert!(options_for(&json!({"maskMargin":-1}), false).is_err());
+        assert!(options_for(&json!({"backend":"comfy","checkpoint":"inpaint.safetensors","maskMargin":1}), false).is_err());
+    }
+
     /// Explicit developer QA: downloads are separate from this test and all test pictures
     /// come from the procedural demo library. Normal CI does not need multi-GB model files.
     #[cfg(all(feature = "inpaint", not(target_arch = "wasm32")))]
@@ -146,13 +173,17 @@ mod tests {
         s.generator.dir = Some(model.into());
         assert!(s.generator.installed());
         let source = s.active().unwrap();
+        s.execute("photo.rotateRight", &json!({})).unwrap();
         s.execute("crop.set", &json!({"rect":[0.1,0.1,0.9,0.9]})).unwrap();
         s.execute("mask.add", &json!({"kind":"radial","center":[0.5,0.6],"rx":0.18,"ry":0.16})).unwrap();
         let mid = s.active_mask.unwrap();
         let original_photo = s.catalog.photo(source).unwrap().clone();
-        let expected = s.render_job(source, 256, 256, false, true).unwrap().run().rendered.unwrap().image;
+        let (native_w, native_h) =
+            lightcraft_pipeline::native_output_size(original_photo.width as usize, original_photo.height as usize, &original_photo.develop);
+        let edge = (native_w.round() as usize).max(native_h.round() as usize);
+        let expected = s.render_job(source, edge, edge, false, true).unwrap().run().rendered.unwrap().image;
         let mask = s
-            .render_job(source, 256, 256, false, true)
+            .render_job(source, edge, edge, false, true)
             .unwrap()
             .with_overlay(lightcraft_pipeline::Overlay::Mask {
                 id: mid as u16,

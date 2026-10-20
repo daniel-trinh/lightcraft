@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 dhat = { workspace = true, optional = true }
 
 [features]
+cuda = ["lightcraft-engine/cuda"]
 # Heap profiling: `cargo run --release -p lightcraft-cli --features dhat-heap -- snapshot …` counts
 # every allocation (live/peak bytes in `library.memory` / `ui.inspect`) and writes dhat-heap.json
 # (open it in DHAT's viewer: allocation sites by bytes at the peak). Slows allocation-heavy work.

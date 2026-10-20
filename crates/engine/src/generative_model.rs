@@ -9,6 +9,18 @@ pub const NOT_INSTALLED: &str = "The inpainting model is not installed";
 pub const LICENSE_NAME: &str = "CreativeML OpenRAIL-M";
 pub const LICENSE_URL: &str = "https://huggingface.co/spaces/CompVis/stable-diffusion-license";
 
+pub fn backend_description() -> &'static str {
+    if std::env::var("LIGHTCRAFT_AI_DEVICE").as_deref() == Ok("cpu") {
+        "CPU (explicit diagnostic override)"
+    } else if cfg!(feature = "cuda") {
+        "NVIDIA GPU (CUDA)"
+    } else if cfg!(target_os = "macos") {
+        "Metal when available, otherwise CPU"
+    } else {
+        "CPU"
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct DownloadStatus {
     pub running: bool,

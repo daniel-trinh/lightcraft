@@ -64,6 +64,8 @@ pub type SharedWrite = std::sync::Arc<dyn Fn(&str, &[u8]) -> Result<(), String> 
 pub type PngEncode = Box<dyn Fn(&lightcraft_raster::Rgba8) -> Vec<u8>>;
 /// A folder chooser (`None` = cancelled).
 pub type PickFolder = Box<dyn FnMut() -> Option<String>>;
+/// Choose an existing SAM 3 model folder (`None` = cancelled; desktop only).
+pub type PickSamModelFolder = Box<dyn FnMut() -> Option<String>>;
 /// Reveal a file in the system file manager (Finder / Explorer / the folder on Linux).
 pub type RevealFn = Box<dyn FnMut(&str) -> Result<(), String>>;
 /// Open a URL in the user's browser.
@@ -98,6 +100,8 @@ pub struct Services {
     pub reveal: Option<RevealFn>,
     /// Choose a folder (Settings → General → Open Library…; desktop only).
     pub pick_folder: Option<PickFolder>,
+    /// Choose a local SAM 3 model folder (desktop only).
+    pub pick_sam_model_folder: Option<PickSamModelFolder>,
     /// Open a web link in the browser (Help menu, About, Discord button).
     pub open_url: Option<OpenUrlFn>,
     /// Open a file in an external editor (Edit in External Editor; desktop only).

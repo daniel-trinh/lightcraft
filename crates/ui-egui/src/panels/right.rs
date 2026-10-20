@@ -353,16 +353,13 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     header(ui, "Generative Fill and Remove");
     padded(ui, |ui| {
         ui.label("Select a mask in Masking. Fill replaces it using your prompt; Remove reconstructs its background. Each result is a new photo.");
-        ui.label("Runs on your computer. Generated copies have an edge of at most 512 px.");
+        ui.label("Runs on your computer. Edits retain the cropped photo's resolution.");
+        ui.label("For removal, include the whole object and its shadow in the mask.");
         if !lightcraft_engine::generative_model::Generator::AVAILABLE {
             ui.label("Generative fill is unavailable in this build.");
             return;
         }
-        ui.label(if cfg!(target_os = "macos") {
-            "Uses your Mac's GPU when available, otherwise CPU."
-        } else {
-            "Uses the CPU. Generation can take several minutes."
-        });
+        ui.label(format!("Inference: {}", lightcraft_engine::generative_model::backend_description()));
         let download = app.session.generator.download_status();
         let installed = app.session.generator.installed();
         if !installed {
@@ -396,7 +393,7 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         if let Some(error) = &download.error {
             ui.label(format!("Model setup: {error}"));
         }
-        ui.label("Replacement prompt (optional)");
+        ui.label("Replacement prompt (Fill only)");
         let r = ui.text_edit_singleline(&mut app.ui.generative_prompt);
         register(ui.ctx(), "field:generativePrompt", r.rect);
         ui.label("Negative prompt (optional)");
@@ -450,9 +447,10 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 negative,
                 steps: 24,
                 guidance: 7.5,
-                denoise: 1.0,
+                denoise: 0.99,
                 seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                 edge: 512,
+                mask_margin: if remove_clicked { lightcraft_engine::generative::REMOVE_MASK_MARGIN } else { 0 },
             };
             let demo_dir = (!app.ui.generative_demo_dir.trim().is_empty()).then_some(app.ui.generative_demo_dir.as_str());
             match app.session.plan_generative(id, mask, opts, demo_dir) {

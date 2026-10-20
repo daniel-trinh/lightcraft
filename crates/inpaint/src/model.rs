@@ -1,4 +1,4 @@
-//! SD 1.5 9-channel latent inpainting on Candle CPU or Metal.
+//! SD 1.5 9-channel latent inpainting on Candle CPU, Metal, or optional CUDA.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +36,9 @@ pub struct GenerateOptions {
     pub seed: u64,
     pub steps: usize,
     pub guidance: f64,
+    /// Fraction of the DDIM schedule to run. Values below one start from the
+    /// source image's VAE latents with noise at the first selected timestep.
+    pub strength: f64,
 }
 
 impl GenerateOptions {
@@ -49,8 +52,15 @@ impl GenerateOptions {
         if !self.guidance.is_finite() || !(1.0..=20.0).contains(&self.guidance) {
             return Err(Error::Model("guidance must be 1..20".into()));
         }
+        if !self.strength.is_finite() || !(0.0..=1.0).contains(&self.strength) || selected_step_count(self.steps, self.strength) == 0 {
+            return Err(Error::Model("strength must be >0 and <=1, and select at least one denoising step".into()));
+        }
         Ok(())
     }
+}
+
+fn selected_step_count(steps: usize, strength: f64) -> usize {
+    ((steps as f64) * strength).floor() as usize
 }
 
 pub struct Model {
@@ -62,12 +72,22 @@ pub struct Model {
     unet: unet_2d::UNet2DConditionModel,
 }
 
-fn best_device() -> Device {
-    #[cfg(target_os = "macos")]
-    if let Ok(device) = Device::new_metal(0) {
-        return device;
+fn best_device() -> Result<Device> {
+    if std::env::var("LIGHTCRAFT_AI_DEVICE").as_deref() == Ok("cpu") {
+        return Ok(Device::Cpu);
     }
-    Device::Cpu
+    #[cfg(feature = "cuda")]
+    {
+        Device::new_cuda(0).map_err(|e| Error::Model(format!("Cannot initialize the NVIDIA GPU: {e}. Use the packaged CUDA runtime libraries and an up-to-date NVIDIA driver. Set LIGHTCRAFT_AI_DEVICE=cpu only to explicitly select slower CPU inference.")))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        #[cfg(target_os = "macos")]
+        if let Ok(device) = Device::new_metal(0) {
+            return Ok(device);
+        }
+        Ok(Device::Cpu)
+    }
 }
 
 fn builder(dir: &Path, component: &str, file: &str, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
@@ -107,11 +127,19 @@ fn vae_config() -> vae::AutoEncoderKLConfig {
 }
 
 impl Model {
+    pub fn device_description(&self) -> &'static str {
+        match self.device {
+            Device::Cpu => "CPU",
+            Device::Cuda(_) => "NVIDIA CUDA",
+            Device::Metal(_) => "Metal",
+        }
+    }
+
     pub fn load(dir: &Path) -> Result<Self> {
         if !installed(dir) {
             return Err(Error::Model(format!("inpainting checkpoint is missing or incomplete in {}", dir.display())));
         }
-        let device = best_device();
+        let device = best_device()?;
         let dtype = if matches!(device, Device::Cpu) { DType::F32 } else { DType::F16 };
         let tokenizer = Tokenizer::load(&dir.join("tokenizer"))?;
         let clip = clip::ClipTextTransformer::new(builder(dir, "text_encoder", "model.fp16.safetensors", dtype, &device)?, &clip::Config::v1_5())?;
@@ -141,16 +169,33 @@ impl Model {
         options.validate()?;
         validate_input(rgb8, mask8, width, height)?;
         check_cancel(cancel)?;
-        let (mask, masked_image) = conditioning_inputs(rgb8, mask8, width, height, &self.device, self.dtype)?;
-        let mask_latents = (self.vae.encode(&masked_image)?.sample()? * 0.18215)?.to_dtype(self.dtype)?;
+        let (image, mask, masked_image) = conditioning_inputs(rgb8, mask8, width, height, &self.device, self.dtype)?;
+        // Candle's CPU RNG cannot be seeded. CUDA and Metal seed both VAE
+        // posterior samples; initial diffusion noise is independently seeded below.
+        if !matches!(self.device, Device::Cpu) {
+            self.device.set_seed(options.seed)?;
+        }
         let low_mask = mask.interpolate2d(height / 8, width / 8)?;
         let (positive, negative) = (self.embed(&options.prompt)?, self.embed(&options.negative)?);
         let embeddings = Tensor::cat(&[negative, positive], 0)?;
         let mut scheduler = ddim::DDIMSchedulerConfig::default().build(options.steps)?;
+        let active_steps = selected_step_count(options.steps, options.strength);
+        let timesteps: Vec<_> = scheduler
+            .timesteps()
+            .get(options.steps - active_steps..)
+            .ok_or_else(|| Error::Model("DDIM returned an invalid timestep schedule".into()))?
+            .to_vec();
         let mut rng = Noise::new(options.seed);
         let noise = rng.tensor((1, 4, height / 8, width / 8), &self.device, self.dtype)?;
-        let mut latents = (noise * scheduler.init_noise_sigma())?;
-        for (index, &timestep) in scheduler.timesteps().to_vec().iter().enumerate() {
+        let mut latents = if options.strength == 1.0 {
+            (noise * scheduler.init_noise_sigma())?
+        } else {
+            let source_latents = (self.vae.encode(&image)?.sample()? * 0.18215)?.to_dtype(self.dtype)?;
+            let initial_timestep = timesteps.first().copied().ok_or_else(|| Error::Model("DDIM returned no timesteps".into()))?;
+            scheduler.add_noise(&source_latents, noise, initial_timestep)?
+        };
+        let mask_latents = (self.vae.encode(&masked_image)?.sample()? * 0.18215)?.to_dtype(self.dtype)?;
+        for (index, &timestep) in timesteps.iter().enumerate() {
             check_cancel(cancel)?;
             let duplicated = Tensor::cat(&[&latents, &latents], 0)?;
             let scaled = scheduler.scale_model_input(duplicated, timestep)?;
@@ -164,7 +209,7 @@ impl Model {
             };
             let guided = (uncond + ((text - uncond)? * options.guidance)?)?;
             latents = scheduler.step(&guided, timestep, &latents)?;
-            progress(index + 1, options.steps);
+            progress(index + 1, active_steps);
         }
         check_cancel(cancel)?;
         let image = self.vae.decode(&(latents / 0.18215)?)?;
@@ -183,7 +228,7 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) { Err(Error::Cancelled) } else { Ok(()) }
 }
 
-fn conditioning_inputs(rgb8: &[u8], mask8: &[u8], width: usize, height: usize, device: &Device, dtype: DType) -> Result<(Tensor, Tensor)> {
+fn conditioning_inputs(rgb8: &[u8], mask8: &[u8], width: usize, height: usize, device: &Device, dtype: DType) -> Result<(Tensor, Tensor, Tensor)> {
     let image = Tensor::from_vec(rgb8.to_vec(), (1, height, width, 3), &Device::Cpu)?
         .permute((0, 3, 1, 2))?
         .to_dtype(DType::F32)?
@@ -193,7 +238,7 @@ fn conditioning_inputs(rgb8: &[u8], mask8: &[u8], width: usize, height: usize, d
     let mask = Tensor::from_vec(mask8.to_vec(), (1, 1, height, width), &Device::Cpu)?.to_device(device)?.ge(128u8)?.to_dtype(dtype)?;
     let keep = mask.le(0.5)?.repeat((1, 3, 1, 1))?.to_dtype(dtype)?;
     let masked_image = image.broadcast_mul(&keep)?;
-    Ok((mask, masked_image))
+    Ok((image, mask, masked_image))
 }
 
 fn validate_input(rgb: &[u8], mask: &[u8], width: usize, height: usize) -> Result<()> {
@@ -243,6 +288,37 @@ impl Noise {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires packaged CUDA libraries, NVIDIA GPU, and LIGHTCRAFT_INPAINT_TEST_MODEL"]
+    fn real_cuda_model_generates_on_gpu() {
+        let path = std::env::var_os("LIGHTCRAFT_INPAINT_TEST_MODEL").expect("model directory");
+        let mut model = Model::load(Path::new(&path)).unwrap();
+        assert_eq!(model.device_description(), "NVIDIA CUDA");
+        let side = 512;
+        let rgb = vec![128u8; side * side * 3];
+        let mut mask = vec![0u8; side * side];
+        for y in 192..320 {
+            for x in 192..320 {
+                mask[y * side + x] = 255;
+            }
+        }
+        let options = GenerateOptions {
+            prompt: "a red apple on a gray table, photograph".into(),
+            negative: String::new(),
+            seed: 42,
+            steps: 4,
+            guidance: 7.5,
+            strength: 0.99,
+        };
+        let started = std::time::Instant::now();
+        let result =
+            model.generate(&rgb, &mask, side, side, &options, &AtomicBool::new(false), |step, total| eprintln!("CUDA step {step}/{total}")).unwrap();
+        assert_eq!(result.len(), side * side * 3);
+        assert!(result.iter().any(|&v| v != 128));
+        eprintln!("Verified {} 512px inference in {:.2}s", model.device_description(), started.elapsed().as_secs_f64());
+    }
+
     #[test]
     fn white_mask_removes_pixels_from_conditioning_and_cancellation_is_reported() {
         let mut rgb = vec![0u8; 64 * 64 * 3];
@@ -250,7 +326,8 @@ mod tests {
         rgb[3..6].copy_from_slice(&[255, 128, 0]);
         let mut mask = vec![0u8; 64 * 64];
         mask[0] = 255;
-        let (mask_t, condition) = conditioning_inputs(&rgb, &mask, 64, 64, &Device::Cpu, DType::F32).unwrap();
+        let (image, mask_t, condition) = conditioning_inputs(&rgb, &mask, 64, 64, &Device::Cpu, DType::F32).unwrap();
+        assert_eq!(image.dims(), [1, 3, 64, 64]);
         assert_eq!(mask_t.dims(), [1, 1, 64, 64]);
         assert_eq!(condition.dims(), [1, 3, 64, 64]);
         assert_eq!(condition.get(0).unwrap().get(0).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()[0], 0.0);
@@ -273,5 +350,33 @@ mod tests {
         let y = b.tensor((1, 4, 8, 8), &Device::Cpu, DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(x, y);
         assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn strength_selects_the_reference_ddim_tail_and_rejects_empty_schedules() {
+        let mut options = GenerateOptions { prompt: String::new(), negative: String::new(), seed: 7, steps: 20, guidance: 7.5, strength: 0.99 };
+        options.validate().unwrap();
+        assert_eq!(selected_step_count(options.steps, options.strength), 19);
+        let scheduler = ddim::DDIMSchedulerConfig::default().build(options.steps).unwrap();
+        let all = scheduler.timesteps();
+        let selected = all.get(options.steps - selected_step_count(options.steps, options.strength)..).unwrap();
+        assert_eq!(selected.len(), 19);
+        assert_eq!(selected.first(), all.get(1));
+        assert_eq!(selected.last(), all.last());
+        assert_eq!(selected.first(), Some(&901));
+        assert_eq!(selected.last(), Some(&1));
+
+        options.strength = 1.0;
+        options.validate().unwrap();
+        assert_eq!(selected_step_count(options.steps, options.strength), 20);
+        options.strength = 0.01;
+        assert!(options.validate().is_err());
+        options.strength = f64::NAN;
+        assert!(options.validate().is_err());
+        options.steps = 1;
+        options.strength = 0.99;
+        assert!(options.validate().is_err());
+        options.strength = 1.0;
+        options.validate().unwrap();
     }
 }

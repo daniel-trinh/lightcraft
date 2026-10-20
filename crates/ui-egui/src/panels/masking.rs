@@ -91,6 +91,10 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 .small()
                 .color(t.text_dim),
         );
+        if lightcraft_engine::segment::Segmenter::AVAILABLE && text_button(ui, "maskSamSetup", crate::i18n::tr("AI Model Setup…"), false).clicked()
+        {
+            app.offer_sam_download(None);
+        }
         ui.add_space(6.0);
         let tiles: [(&str, &str, Icon); 10] = [
             ("object", "Object", Icon::Subject),

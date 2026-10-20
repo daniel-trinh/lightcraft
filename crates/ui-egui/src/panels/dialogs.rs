@@ -97,7 +97,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         Dialog::Merge { opts } => opts.title(),
         Dialog::Settings { .. } => "Settings",
         Dialog::ConfirmDelete { .. } => "Delete Photos",
-        Dialog::SamModel { .. } => "Download the SAM 3 Model?",
+        Dialog::SamModel { .. } => "AI Mask Model",
         Dialog::About => "About LightCraft",
         Dialog::Shortcuts => "Keyboard Shortcuts",
     }
@@ -704,7 +704,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                 Dialog::Merge { opts } => crate::merge::body(app, ui, opts),
                 Dialog::Import { opts } => crate::import::body(app, ui, opts),
                 Dialog::Settings { tab } => crate::panels::settings::body(app, ui, tab),
-                Dialog::SamModel { error, .. } => sam_model_body(app, ui, error.as_deref()),
+                Dialog::SamModel { error, .. } => sam_model_body(app, ui, error),
                 Dialog::ConfirmDelete { count } => {
                     let what = if *count == 1 { crate::i18n::tr("this photo").to_string() } else { crate::i18n::tr_format!("these {count} photos", count = count) };
                     ui.label(crate::i18n::tr_format!("Move {what} to Recently Deleted?", what = what));
@@ -887,21 +887,42 @@ pub fn keeps_open(app: &LightcraftApp, dlg: &Dialog) -> bool {
 }
 
 /// The SAM 3 dialog: what the model is, its size and licence, and the download's progress.
-fn sam_model_body(app: &mut LightcraftApp, ui: &mut egui::Ui, error: Option<&str>) {
+fn sam_model_body(app: &mut LightcraftApp, ui: &mut egui::Ui, error: &mut Option<String>) {
     use lightcraft_engine::segment::{LICENSE_NAME, LICENSE_URL, MODEL_BYTES};
     let t = Tokens::get(ui.ctx());
-    let seg = &app.session.segmenter;
-    let d = seg.download_status();
-    if seg.installed() {
+    let d = app.session.segmenter.download_status();
+    let dir = app.session.segmenter.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+    ui.label(format!("{} {dir}", crate::i18n::tr("SAM 3 model folder:")));
+    let choose =
+        ui.add_enabled(!d.running && app.services.pick_sam_model_folder.is_some(), egui::Button::new(crate::i18n::tr("Choose Model Folder…")));
+    crate::widgets::register(ui.ctx(), "button:samChooseModelFolder", choose.rect);
+    if choose.clicked()
+        && let Some(path) = app.services.pick_sam_model_folder.as_mut().and_then(|pick| pick())
+    {
+        match app.run("segment.model.useDirectory", json!({"dir": path})) {
+            Ok(result) => {
+                if let Some(path) = result.get("dir").and_then(serde_json::Value::as_str) {
+                    app.ui.settings.sam_model_dir = path.to_string();
+                    *error = None;
+                } else {
+                    *error = Some("The model folder command returned no folder path".into());
+                }
+            }
+            Err(e) => *error = Some(e),
+        }
+    }
+    if app.session.segmenter.installed() {
         ui.label(crate::i18n::tr("The SAM 3 model is installed: Object and Describe masks are ready."));
+        if let Some(e) = error.as_deref().map(str::to_string).or(d.error) {
+            ui.label(egui::RichText::new(format!("{} {e}", crate::i18n::tr("AI model setup:"))).color(egui::Color32::from_rgb(230, 90, 80)));
+        }
         return;
     }
     let gb = |b: u64| b as f64 / 1e9;
     ui.label(crate::i18n::tr(
         "Object and Describe masks use SAM 3, Meta's segmentation model. It isn't part of LightCraft, and everything else works without it.",
     ));
-    let dir = seg.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
-    ui.label(format!("{} {:.1} GB, {} {dir}", crate::i18n::tr("A one-time download of about"), gb(MODEL_BYTES), crate::i18n::tr("saved in")));
+    ui.label(format!("{} {:.1} GB", crate::i18n::tr("A one-time download of about"), gb(MODEL_BYTES)));
     ui.label(
         egui::RichText::new(format!(
             "{} {LICENSE_NAME} — {}",
@@ -915,7 +936,6 @@ fn sam_model_body(app: &mut LightcraftApp, ui: &mut egui::Ui, error: Option<&str
     if r.clicked() {
         let _ = crate::links::open(app, LICENSE_URL);
     }
-    let seg = &app.session.segmenter;
     if d.running {
         ui.add_space(4.0);
         let frac = if d.total > 0 { d.done as f64 / d.total as f64 } else { 0.0 };
@@ -931,16 +951,21 @@ fn sam_model_body(app: &mut LightcraftApp, ui: &mut egui::Ui, error: Option<&str
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         return;
     }
-    if seg.mirrors().is_empty() {
+    if app.session.segmenter.mirrors().is_empty() {
         ui.label(
             egui::RichText::new(crate::i18n::tr(
-                "This build has no download location for the model yet: put the files in the folder above yourself (see docs/ai-masks.md).",
+                "Meta requires access approval on Hugging Face. After approval, download model.safetensors, vocab.json and merges.txt into one folder, then choose that folder above.",
             ))
             .color(t.text_dim),
         );
+        let page = ui.link(crate::i18n::tr("Open SAM 3 download page"));
+        crate::widgets::register(ui.ctx(), "link:samDownloadPage", page.rect);
+        if page.clicked() {
+            let _ = crate::links::open(app, "https://huggingface.co/facebook/sam3");
+        }
     }
-    if let Some(e) = error.map(str::to_string).or(d.error) {
-        ui.label(egui::RichText::new(format!("{} {e}", crate::i18n::tr("The download didn't work:"))).color(egui::Color32::from_rgb(230, 90, 80)));
+    if let Some(e) = error.as_deref().map(str::to_string).or(d.error) {
+        ui.label(egui::RichText::new(format!("{} {e}", crate::i18n::tr("AI model setup:"))).color(egui::Color32::from_rgb(230, 90, 80)));
     }
 }
 

@@ -679,6 +679,48 @@ fn ai_masks_without_the_model_offer_the_download() {
 }
 
 #[test]
+fn ai_model_setup_can_be_reopened_without_starting_inference_or_downloads() {
+    use crate::state::Dialog;
+    if !lightcraft_engine::segment::Segmenter::AVAILABLE {
+        return;
+    }
+    let mut h = detail("panel.masking");
+    let r = h.request("ui.clickWidget", json!({"id": "button:maskSamSetup"}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(h.app.ui.dialog, Some(Dialog::SamModel { then: None, error: None }));
+    assert!(!h.app.session.segmenter.busy());
+    assert!(!h.app.session.segmenter.download_status().running);
+}
+
+#[test]
+fn choose_local_sam_model_folder_updates_engine_and_persisted_setting() {
+    use lightcraft_engine::segment::Segmenter;
+    if !Segmenter::AVAILABLE {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("lc-ui-local-sam3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in ["model.safetensors", "vocab.json", "merges.txt"] {
+        std::fs::write(dir.join(file), b"test fixture").unwrap();
+    }
+    let selected = dir.to_string_lossy().to_string();
+    let services = Services { pick_sam_model_folder: Some(Box::new(move || Some(selected.clone()))), ..Default::default() };
+    let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), services);
+    let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
+    h.app.offer_sam_download(None);
+    assert!(h.step_until(T, |h| h.app.widgets.iter().any(|(id, _)| id == "button:samChooseModelFolder")), "model folder picker did not render");
+    h.settle(SETTLE);
+    let r = h.request("ui.clickWidget", json!({"id":"button:samChooseModelFolder"}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    let canonical = dir.canonicalize().unwrap();
+    assert_eq!(h.app.session.segmenter.dir.as_deref(), Some(canonical.as_path()));
+    assert_eq!(h.app.ui.settings.sam_model_dir, canonical.to_string_lossy());
+    assert!(h.app.session.segmenter.installed());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ai_preset_buttons_require_a_model_and_keep_the_requested_kind() {
     use crate::state::Dialog;
     use lightcraft_engine::segment::Segmenter;

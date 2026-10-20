@@ -13,11 +13,16 @@ use lightcraft_pipeline::{MaskView, Overlay};
 use lightcraft_raster::Rgba8;
 use serde_json::{Value, json};
 
-use crate::{Session, media::RenderJob};
+use crate::{
+    Session,
+    media::{RenderJob, SourceLevel, SourceRef},
+};
 
 const MAX_RESPONSE: usize = 64 * 1024 * 1024;
 const MAX_EDGE: usize = 2048;
 const NATIVE_MAX_EDGE: usize = 512;
+const MAX_NATIVE_PIXELS: usize = 64_000_000;
+pub const REMOVE_MASK_MARGIN: usize = 32;
 static NEXT_NAME: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -29,9 +34,11 @@ pub struct Options {
     pub negative: String,
     pub steps: u32,
     pub guidance: f64,
-    pub denoise: f32,
+    pub denoise: f64,
     pub seed: u64,
     pub edge: usize,
+    /// Extra conditioning mask pixels on the model canvas. The final blend uses the original mask.
+    pub mask_margin: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +49,9 @@ pub enum Backend {
 
 impl Options {
     pub fn validate(&self) -> Result<(), String> {
+        if self.mask_margin > 64 {
+            return Err("maskMargin must be 0..64 model pixels".into());
+        }
         if self.prompt.len() > 4096 || self.negative.len() > 4096 {
             return Err("prompt is too long (maximum 4096 bytes)".into());
         }
@@ -53,14 +63,20 @@ impl Options {
         }
         match self.backend {
             Backend::Native => {
-                if !self.denoise.is_finite() || self.denoise != 1.0 {
-                    return Err("native inpainting currently requires denoise=1; partial denoising is only available with backend=comfy".into());
+                if !self.denoise.is_finite() || !(0.0..=1.0).contains(&self.denoise) || self.denoise == 0.0 {
+                    return Err("native denoise must be greater than 0 and no more than 1".into());
+                }
+                if (self.denoise * f64::from(self.steps)).floor() < 1.0 {
+                    return Err("native denoise and steps must leave at least one diffusion step".into());
                 }
                 if !(64..=NATIVE_MAX_EDGE).contains(&self.edge) {
                     return Err("native inpainting supports image edges from 64 to 512 pixels".into());
                 }
             }
             Backend::Comfy => {
+                if self.mask_margin != 0 {
+                    return Err("maskMargin is only available with backend=native".into());
+                }
                 endpoint(&self.endpoint)?;
                 if self.checkpoint.trim().is_empty() || self.checkpoint.chars().any(char::is_control) {
                     return Err("choose an installed ComfyUI checkpoint filename".into());
@@ -98,7 +114,7 @@ pub struct Job {
 impl Session {
     pub fn plan_generative(&mut self, id: PhotoId, mask_id: u32, options: Options, demo_dir: Option<&str>) -> Result<Job, String> {
         options.validate()?;
-        let photo = self.catalog.photo(id).ok_or("no such photo")?;
+        let photo = self.catalog.photo(id).ok_or("no such photo")?.clone();
         if !photo.develop.masks.iter().any(|m| m.id == mask_id && !m.components.is_empty()) {
             return Err("select a nonempty mask first".into());
         }
@@ -121,14 +137,37 @@ impl Session {
             }
             Backend::Comfy => None,
         };
-        let image = self.render_job(id, options.edge, options.edge, false, true).ok_or("could not render photo")?;
+        let render_edge = if options.backend == Backend::Native {
+            if u64::from(photo.width).saturating_mul(u64::from(photo.height)) > MAX_NATIVE_PIXELS as u64 {
+                return Err("the source exceeds the 64 MP safety limit; export a smaller copy first".into());
+            }
+            let (w, h) = lightcraft_pipeline::native_output_size(photo.width.max(1) as usize, photo.height.max(1) as usize, &photo.develop);
+            if !w.is_finite() || !h.is_finite() || w < 1.0 || h < 1.0 || w * h > MAX_NATIVE_PIXELS as f64 {
+                return Err("the full-resolution edit exceeds the 64 MP safety limit; export a smaller copy first".into());
+            }
+            let (render_w, render_h) = (w.round() as usize, h.round() as usize);
+            if render_w.saturating_mul(render_h) > MAX_NATIVE_PIXELS {
+                return Err("the full-resolution edit exceeds the 64 MP safety limit; export a smaller copy first".into());
+            }
+            render_w.max(render_h).max(1)
+        } else {
+            options.edge
+        };
+        let mut image = self.render_job(id, render_edge, render_edge, false, true).ok_or("could not render photo")?;
         let mid = u16::try_from(mask_id).map_err(|_| "mask id is too large for rendering")?;
-        let mask = self.render_job(id, options.edge, options.edge, false, true).ok_or("could not render mask")?.with_overlay(Overlay::Mask {
+        let mut mask = self.render_job(id, render_edge, render_edge, false, true).ok_or("could not render mask")?.with_overlay(Overlay::Mask {
             id: mid,
             view: MaskView::WhiteOnBlack,
             color: [255; 3],
             opacity: 100,
         });
+        // A tight crop may have a short output edge while still needing native source pixels.
+        if options.backend == Backend::Native {
+            image.level = SourceLevel::Full;
+            image.source = self.media.source_ref(&photo, SourceLevel::Full);
+            mask.level = SourceLevel::Full;
+            mask.source = image.source.clone();
+        }
         let destination = unique_destination(&dir, &stem);
         Ok(Job { original: id, destination, options, image, mask, model_dir })
     }
@@ -160,26 +199,24 @@ impl Job {
         if cancel.load(Ordering::Relaxed) {
             return Err("generation cancelled".into());
         }
-        let mut image = self.image.run().rendered?.image;
-        let mask = self.mask.run().rendered?.image;
+        let rendered_image = self.image.run();
+        let mut mask_job = self.mask;
+        if let Some(source) = rendered_image.loaded {
+            mask_job.source = SourceRef::Loaded(Box::new(source));
+        }
+        let mut image = rendered_image.rendered?.image;
+        let mask = mask_job.run().rendered?.image;
         if (image.width, image.height) != (mask.width, mask.height) || image.width == 0 || image.height == 0 {
             return Err("mask and photo sizes do not match".into());
         }
-        let minimum = if self.options.backend == Backend::Native { 64 } else { 8 };
-        let (w, h) = (image.width.next_multiple_of(8).max(minimum), image.height.next_multiple_of(8).max(minimum));
-        let mut mask_png = Rgba8::new(mask.width, mask.height);
-        let mut selected = false;
-        for (src, dst) in mask.data.iter().zip(&mut mask_png.data) {
-            selected |= src[0] > 8;
-            // ComfyUI's LoadImageMask inverts the PNG alpha channel.
-            *dst = [0, 0, 0, 255 - src[0]];
+        if self.options.backend == Backend::Native && image.width.saturating_mul(image.height) > MAX_NATIVE_PIXELS {
+            return Err("the rendered edit exceeds the 64 MP safety limit; export a smaller copy first".into());
         }
-        if !selected {
+        if !mask.data.iter().any(|px| px[0] > 8) {
             return Err("the selected mask has no visible area".into());
         }
-        let padded_image = pad_edges(&image, w, h);
         progress(0, 1);
-        let generated = match self.options.backend {
+        match self.options.backend {
             Backend::Native => {
                 #[cfg(all(feature = "inpaint", not(target_arch = "wasm32")))]
                 {
@@ -191,11 +228,27 @@ impl Job {
                     if cancel.load(Ordering::Relaxed) {
                         return Err("generation cancelled".into());
                     }
-                    let mut rgb = Vec::with_capacity(w * h * 3);
-                    for px in &padded_image.data {
+                    let roi = selected_roi(&mask, self.options.edge).ok_or("the selected mask has no visible area")?;
+                    let patch = roi_patch(&image, roi);
+                    let mut rgb = Vec::with_capacity(patch.width * patch.height * 3);
+                    for px in &patch.data {
                         rgb.extend_from_slice(px.get(..3).ok_or("invalid rendered pixel")?);
                     }
-                    let mask8 = native_mask8(&mask, w, h);
+                    let mut mask8 = roi_mask8(&mask, roi);
+                    dilate_mask8(&mut mask8, patch.width, patch.height, self.options.mask_margin)?;
+                    eprintln!(
+                        "Lightcraft inpaint: device={}, full={}x{}, ROI=({}, {}) {}x{}, model={}x{}, maskMargin={}",
+                        model.device_description(),
+                        image.width,
+                        image.height,
+                        roi.x,
+                        roi.y,
+                        roi.w,
+                        roi.h,
+                        patch.width,
+                        patch.height,
+                        self.options.mask_margin
+                    );
                     let native_options = lightcraft_inpaint::GenerateOptions {
                         prompt: if self.options.prompt.trim().is_empty() {
                             "clean natural background matching the surrounding image".into()
@@ -206,14 +259,15 @@ impl Job {
                         seed: self.options.seed,
                         steps: self.options.steps as usize,
                         guidance: self.options.guidance,
+                        strength: self.options.denoise,
                     };
                     let pixels = model
-                        .generate(&rgb, &mask8, w, h, &native_options, cancel, &mut progress)
+                        .generate(&rgb, &mask8, patch.width, patch.height, &native_options, cancel, &mut progress)
                         .map_err(|e| format!("native inpainting failed: {e}"))?;
-                    if pixels.len() != w.saturating_mul(h).saturating_mul(3) {
+                    if pixels.len() != patch.width.saturating_mul(patch.height).saturating_mul(3) {
                         return Err("native inpainting returned an invalid image size".into());
                     }
-                    let mut generated = Rgba8::new(w, h);
+                    let mut generated = Rgba8::new(patch.width, patch.height);
                     for (dst, src) in generated.data.iter_mut().zip(pixels.as_chunks::<3>().0) {
                         let rgb = src.get(..3).ok_or("invalid generated pixel")?;
                         dst.get_mut(..3).ok_or("invalid output pixel")?.copy_from_slice(rgb);
@@ -221,7 +275,7 @@ impl Job {
                             *alpha = 255;
                         }
                     }
-                    Rgba8::from_fn(image.width, image.height, |x, y| generated.get(x, y))
+                    composite_roi(&mut image, &generated, &mask, roi);
                 }
                 #[cfg(not(all(feature = "inpaint", not(target_arch = "wasm32"))))]
                 {
@@ -230,6 +284,13 @@ impl Job {
                 }
             }
             Backend::Comfy => {
+                let (w, h) = (image.width.next_multiple_of(8).max(8), image.height.next_multiple_of(8).max(8));
+                let padded_image = pad_edges(&image, w, h);
+                let mut mask_png = Rgba8::new(mask.width, mask.height);
+                for (src, dst) in mask.data.iter().zip(&mut mask_png.data) {
+                    // ComfyUI's LoadImageMask inverts the PNG alpha channel.
+                    *dst = [0, 0, 0, 255 - src[0]];
+                }
                 if cancel.load(Ordering::Relaxed) {
                     return Err("generation cancelled".into());
                 }
@@ -268,18 +329,16 @@ impl Job {
                 if (generated.width, generated.height) != (w, h) {
                     return Err(format!("ComfyUI output is {}×{}, expected {w}×{h}", generated.width, generated.height));
                 }
-                Rgba8::from_fn(image.width, image.height, |x, y| generated.get(x, y))
+                let generated = Rgba8::from_fn(image.width, image.height, |x, y| generated.get(x, y));
+                composite(&mut image, &generated, &mask);
             }
-        };
-        if self.options.backend == Backend::Native {
-            progress(self.options.steps as usize, self.options.steps as usize);
-        } else {
+        }
+        if self.options.backend == Backend::Comfy {
             progress(1, 1);
         }
         if cancel.load(Ordering::Relaxed) {
             return Err("generation cancelled".into());
         }
-        composite(&mut image, &generated, &mask);
         let output = png(&image)?;
         let path = lightcraft_catalog::safe_file::write_new_unique(
             &mut (0u32..).map(|n| {
@@ -301,11 +360,186 @@ fn pad_edges(src: &Rgba8, w: usize, h: usize) -> Rgba8 {
     Rgba8::from_fn(w, h, |x, y| src.get(x.min(src.width - 1), y.min(src.height - 1)))
 }
 
+/// A selected bounding box with native-resolution context. Only the model canvas is resized.
 #[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
-fn native_mask8(mask: &Rgba8, w: usize, h: usize) -> Vec<u8> {
-    // Diffusion conditioning is binary. Keep the original soft mask for final blending,
-    // so low-opacity selections still request generation and retain their intended opacity.
-    pad_edges(mask, w, h).data.into_iter().map(|px| if px[0] > 8 { 255 } else { 0 }).collect()
+#[derive(Clone, Copy, Debug)]
+struct Roi {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    active_w: usize,
+    active_h: usize,
+    model_w: usize,
+    model_h: usize,
+}
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn selected_roi(mask: &Rgba8, edge: usize) -> Option<Roi> {
+    if mask.width == 0 || mask.height == 0 || mask.width.checked_mul(mask.height) != Some(mask.data.len()) || !(64..=512).contains(&edge) {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (mask.width, mask.height, 0, 0);
+    for (i, px) in mask.data.iter().enumerate() {
+        if px[0] > 0 {
+            let (x, y) = (i % mask.width, i / mask.width);
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    if x0 > x1 || y0 > y1 {
+        return None;
+    }
+    // Give the model surrounding scene context rather than enlarging the hole
+    // to most of its canvas. Small object removal otherwise becomes a close-up
+    // of the selected object and can invent another object in its place.
+    let side = (x1 - x0 + 1).max(y1 - y0 + 1).saturating_mul(3).max(64);
+    let (w, h) = (side.min(mask.width), side.min(mask.height));
+    let x = ((x0 + x1 + 1).saturating_sub(w) / 2).min(mask.width - w);
+    let y = ((y0 + y1 + 1).saturating_sub(h) / 2).min(mask.height - h);
+    let scale = edge as f64 / w.max(h) as f64;
+    let active_w = ((w as f64 * scale).round() as usize).clamp(1, edge);
+    let active_h = ((h as f64 * scale).round() as usize).clamp(1, edge);
+    Some(Roi { x, y, w, h, active_w, active_h, model_w: active_w.next_multiple_of(8).max(64), model_h: active_h.next_multiple_of(8).max(64) })
+}
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn sample_bilinear(src: &Rgba8, x: f64, y: f64) -> [u8; 4] {
+    let x = x.clamp(0.0, (src.width - 1) as f64);
+    let y = y.clamp(0.0, (src.height - 1) as f64);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(src.width - 1), (y0 + 1).min(src.height - 1));
+    let (fx, fy) = (x - x0 as f64, y - y0 as f64);
+    let (a, b, c, d) = (src.get(x0, y0), src.get(x1, y0), src.get(x0, y1), src.get(x1, y1));
+    std::array::from_fn(|i| {
+        ((a[i] as f64 * (1.0 - fx) + b[i] as f64 * fx) * (1.0 - fy) + (c[i] as f64 * (1.0 - fx) + d[i] as f64 * fx) * fy).round() as u8
+    })
+}
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn roi_patch(image: &Rgba8, roi: Roi) -> Rgba8 {
+    Rgba8::from_fn(roi.model_w, roi.model_h, |x, y| {
+        let x = x.min(roi.active_w - 1);
+        let y = y.min(roi.active_h - 1);
+        sample_bilinear(
+            image,
+            roi.x as f64 + (x as f64 + 0.5) * roi.w as f64 / roi.active_w as f64 - 0.5,
+            roi.y as f64 + (y as f64 + 0.5) * roi.h as f64 / roi.active_h as f64 - 0.5,
+        )
+    })
+}
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn roi_mask8(mask: &Rgba8, roi: Roi) -> Vec<u8> {
+    let mut out = vec![0; roi.model_w * roi.model_h];
+    // Sample at model resolution for contiguous masks when the native patch is enlarged.
+    for my in 0..roi.active_h {
+        for mx in 0..roi.active_w {
+            let x = roi.x + ((mx as f64 + 0.5) * roi.w as f64 / roi.active_w as f64).floor() as usize;
+            let y = roi.y + ((my as f64 + 0.5) * roi.h as f64 / roi.active_h as f64).floor() as usize;
+            if mask.get(x.min(mask.width - 1), y.min(mask.height - 1))[0] > 8
+                && let Some(px) = out.get_mut(my * roi.model_w + mx)
+            {
+                *px = 255;
+            }
+        }
+    }
+    // Project every selected native pixel, so thin selections cannot disappear when reduced.
+    for y in 0..roi.h {
+        for x in 0..roi.w {
+            if mask.get(roi.x + x, roi.y + y)[0] > 8 {
+                let mx = x * roi.active_w / roi.w;
+                let my = y * roi.active_h / roi.h;
+                if let Some(px) = out.get_mut(my * roi.model_w + mx) {
+                    *px = 255;
+                }
+            }
+        }
+    }
+    // Inference dimensions are multiples of eight; extend the last active edge into padding.
+    for y in 0..roi.model_h {
+        for x in 0..roi.model_w {
+            if x >= roi.active_w || y >= roi.active_h {
+                let src = out.get(y.min(roi.active_h - 1) * roi.model_w + x.min(roi.active_w - 1)).copied().unwrap_or(0);
+                if let Some(dst) = out.get_mut(y * roi.model_w + x) {
+                    *dst = src;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Square binary dilation on the bounded model canvas, in two linear passes. This mask is
+/// conditioning only: `composite_roi` always receives the untouched full-resolution mask.
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn dilate_mask8(mask: &mut [u8], width: usize, height: usize, margin: usize) -> Result<(), String> {
+    if width == 0
+        || height == 0
+        || width > NATIVE_MAX_EDGE
+        || height > NATIVE_MAX_EDGE
+        || width.checked_mul(height) != Some(mask.len())
+        || margin > 64
+    {
+        return Err("invalid model mask dimensions or margin".into());
+    }
+    if margin == 0 {
+        return Ok(());
+    }
+    let mut horizontal = vec![0u8; mask.len()];
+    let mut sums = Vec::with_capacity(width.max(height) + 1);
+    for y in 0..height {
+        sums.clear();
+        sums.push(0u16);
+        for x in 0..width {
+            let selected = mask.get(y * width + x).is_some_and(|&px| px != 0);
+            sums.push(sums.last().copied().unwrap_or(0) + u16::from(selected));
+        }
+        for x in 0..width {
+            let left = x.saturating_sub(margin);
+            let right = x.saturating_add(margin).saturating_add(1).min(width);
+            let count = sums.get(right).copied().ok_or("invalid model mask row")? - sums.get(left).copied().ok_or("invalid model mask row")?;
+            *horizontal.get_mut(y * width + x).ok_or("invalid model mask row")? = if count > 0 { 255 } else { 0 };
+        }
+    }
+    for x in 0..width {
+        sums.clear();
+        sums.push(0u16);
+        for y in 0..height {
+            let selected = horizontal.get(y * width + x).is_some_and(|&px| px != 0);
+            sums.push(sums.last().copied().unwrap_or(0) + u16::from(selected));
+        }
+        for y in 0..height {
+            let top = y.saturating_sub(margin);
+            let bottom = y.saturating_add(margin).saturating_add(1).min(height);
+            let count = sums.get(bottom).copied().ok_or("invalid model mask column")? - sums.get(top).copied().ok_or("invalid model mask column")?;
+            *mask.get_mut(y * width + x).ok_or("invalid model mask column")? = if count > 0 { 255 } else { 0 };
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn composite_roi(image: &mut Rgba8, generated: &Rgba8, mask: &Rgba8, roi: Roi) {
+    for y in 0..roi.h {
+        for x in 0..roi.w {
+            let index = (roi.y + y) * image.width + roi.x + x;
+            let alpha = mask.data.get(index).map_or(0, |px| px[0]) as u16;
+            if alpha == 0 {
+                continue;
+            }
+            let gx = (x as f64 + 0.5) * roi.active_w as f64 / roi.w as f64 - 0.5;
+            let gy = (y as f64 + 0.5) * roi.active_h as f64 / roi.h as f64 - 0.5;
+            let px = sample_bilinear(generated, gx, gy);
+            if let Some(dst) = image.data.get_mut(index) {
+                for c in 0..3 {
+                    dst[c] = ((u16::from(dst[c]) * (255 - alpha) + u16::from(px[c]) * alpha + 127) / 255) as u8;
+                }
+            }
+        }
+    }
 }
 
 fn composite(image: &mut Rgba8, generated: &Rgba8, mask: &Rgba8) {
@@ -523,6 +757,7 @@ mod tests {
             denoise: 1.0,
             seed: 1,
             edge: 1024,
+            mask_margin: 0,
         };
         o.validate().unwrap();
         let g = workflow(&o, "photo.png", "mask.png", "edit");
@@ -542,9 +777,105 @@ mod tests {
     }
 
     #[test]
-    fn native_mask_uses_white_selected_pixels_and_edge_pads() {
-        let mask = Rgba8 { width: 2, height: 1, data: vec![[0, 0, 0, 255], [50, 0, 0, 255]] };
-        assert_eq!(native_mask8(&mask, 4, 2), vec![0, 255, 255, 255, 0, 255, 255, 255]);
+    fn native_roi_keeps_full_photo_and_unselected_pixels() {
+        let mut image = Rgba8::from_fn(2048, 1024, |x, y| [(x % 251) as u8, (y % 241) as u8, 60, 255]);
+        let original = image.clone();
+        let mask = Rgba8::from_fn(2048, 1024, |x, y| {
+            let alpha = if x == 1899 && (20..100).contains(&y) {
+                128
+            } else if (1900..1990).contains(&x) && (20..100).contains(&y) {
+                255
+            } else {
+                0
+            };
+            [alpha, alpha, alpha, 255]
+        });
+        let roi = selected_roi(&mask, 512).unwrap();
+        assert!(roi.x > 0 && roi.x + roi.w <= image.width);
+        assert!(roi.y + roi.h <= image.height);
+        assert!(roi.model_w <= 512 && roi.model_h <= 512);
+        let patch = roi_patch(&image, roi);
+        assert_eq!((patch.width, patch.height), (roi.model_w, roi.model_h));
+        let mut conditioning = roi_mask8(&mask, roi);
+        let selected_before = conditioning.iter().filter(|&&px| px == 255).count();
+        assert!(selected_before > 1000);
+        dilate_mask8(&mut conditioning, roi.model_w, roi.model_h, REMOVE_MASK_MARGIN).unwrap();
+        assert!(conditioning.iter().filter(|&&px| px == 255).count() > selected_before);
+        let generated = Rgba8::filled(roi.model_w, roi.model_h, [250, 10, 20, 255]);
+        composite_roi(&mut image, &generated, &mask, roi);
+        assert_eq!((image.width, image.height), (2048, 1024));
+        let fill = [250u8, 10, 20];
+        for (before, (after, selection)) in original.data.iter().zip(image.data.iter().zip(&mask.data)) {
+            if selection[0] == 0 {
+                assert_eq!(before, after);
+            } else if selection[0] == 128 {
+                for c in 0..3 {
+                    assert_eq!(after[c], ((u16::from(before[c]) * 127 + u16::from(fill[c]) * 128 + 127) / 255) as u8);
+                }
+                assert_eq!(after[3], before[3]);
+            } else {
+                assert_eq!(after, &[250, 10, 20, 255]);
+            }
+        }
+    }
+
+    #[test]
+    fn conditioning_margin_is_bounded_at_canvas_edges() {
+        let mut mask = vec![0u8; 8 * 8];
+        mask[0] = 255;
+        dilate_mask8(&mut mask, 8, 8, 2).unwrap();
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(mask[y * 8 + x], if x <= 2 && y <= 2 { 255 } else { 0 });
+            }
+        }
+        let unchanged = mask.clone();
+        dilate_mask8(&mut mask, 8, 8, 0).unwrap();
+        assert_eq!(mask, unchanged);
+        assert!(dilate_mask8(&mut mask, 8, 8, 65).is_err());
+        assert!(dilate_mask8(&mut mask, 9, 8, 1).is_err());
+        dilate_mask8(&mut mask, 8, 8, 64).unwrap();
+        assert!(mask.iter().all(|&px| px == 255));
+    }
+
+    #[test]
+    fn native_roi_at_frame_edge_keeps_thin_mask_in_model() {
+        let mask = Rgba8::from_fn(3000, 1800, |x, y| {
+            let a = if x == 0 && (0..1200).contains(&y) { 255 } else { 0 };
+            [a, a, a, 255]
+        });
+        let roi = selected_roi(&mask, 512).unwrap();
+        assert_eq!(roi.x, 0);
+        assert!(roi.w <= 3000 && roi.h <= 1800);
+        assert!(roi.model_w <= 512 && roi.model_h <= 512);
+        assert!(roi_mask8(&mask, roi).contains(&255));
+    }
+
+    #[test]
+    fn cropped_rotated_native_render_matches_mask_geometry() {
+        let mut session = Session::with_demo();
+        let id = session.active().unwrap();
+        session.execute("photo.rotateRight", &json!({})).unwrap();
+        session.execute("crop.set", &json!({"rect": [0.1, 0.2, 0.8, 0.9]})).unwrap();
+        session.execute("mask.add", &json!({"kind": "radial", "center": [0.6, 0.5], "rx": 0.12, "ry": 0.15})).unwrap();
+        let mask_id = session.active_mask.unwrap();
+        let photo = session.catalog.photo(id).unwrap();
+        let (w, h) = lightcraft_pipeline::native_output_size(photo.width as usize, photo.height as usize, &photo.develop);
+        let edge = (w.round() as usize).max(h.round() as usize);
+        let image = session.render_job(id, edge, edge, false, true).unwrap().run().rendered.unwrap().image;
+        let mask = session
+            .render_job(id, edge, edge, false, true)
+            .unwrap()
+            .with_overlay(Overlay::Mask { id: mask_id as u16, view: MaskView::WhiteOnBlack, color: [255; 3], opacity: 100 })
+            .run()
+            .rendered
+            .unwrap()
+            .image;
+        assert_eq!((image.width, image.height), (w.round() as usize, h.round() as usize));
+        assert_eq!((image.width, image.height), (mask.width, mask.height));
+        let roi = selected_roi(&mask, 64).unwrap();
+        assert!(image.width.max(image.height) > roi.model_w.max(roi.model_h));
+        assert_eq!((roi_patch(&image, roi).width, roi_patch(&image, roi).height), (roi.model_w, roi.model_h));
     }
     #[test]
     fn removal_uses_context_prompt_and_keeps_user_negative_terms() {
@@ -613,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn native_generation_options_reject_unsupported_partial_denoise() {
+    fn native_generation_options_accept_partial_denoise_with_active_steps() {
         let options = Options {
             backend: Backend::Native,
             endpoint: String::new(),
@@ -622,16 +953,31 @@ mod tests {
             negative: String::new(),
             steps: 24,
             guidance: 7.5,
-            denoise: 1.0,
+            denoise: 0.99,
             seed: 4,
             edge: 512,
+            mask_margin: 0,
         };
         assert!(options.validate().is_ok());
-        let mut partial = options.clone();
-        partial.denoise = 0.5;
-        assert!(partial.validate().unwrap_err().contains("denoise=1"));
+        let mut one_step = options.clone();
+        one_step.steps = 100;
+        one_step.denoise = 0.01;
+        assert!(one_step.validate().is_ok());
+        let mut zero = options.clone();
+        zero.denoise = 0.0;
+        assert!(zero.validate().unwrap_err().contains("denoise"));
+        let mut nan = options.clone();
+        nan.denoise = f64::NAN;
+        assert!(nan.validate().is_err());
+        let mut no_steps = options.clone();
+        no_steps.steps = 2;
+        no_steps.denoise = 0.49;
+        assert!(no_steps.validate().unwrap_err().contains("one diffusion step"));
         let mut too_large = options;
         too_large.edge = 1024;
         assert!(too_large.validate().unwrap_err().contains("512"));
+        too_large.edge = 512;
+        too_large.mask_margin = 65;
+        assert!(too_large.validate().unwrap_err().contains("maskMargin"));
     }
 }

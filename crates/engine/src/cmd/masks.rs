@@ -466,6 +466,37 @@ pub fn specs() -> Vec<CommandSpec> {
             }
         ),
         cmd!(
+            query "segment.model.useDirectory",
+            "Use Local AI Mask Model Folder",
+            [],
+            None,
+            "{dir} — use an existing SAM 3 model folder containing model.safetensors, vocab.json and merges.txt; validates and returns the canonical folder path → {dir, installed}",
+            super::always,
+            |s, p| {
+                let c = "segment.model.useDirectory";
+                if !crate::segment::Segmenter::AVAILABLE {
+                    return Err(bad(c, "AI masks are not available in this build"));
+                }
+                if s.segmenter.download_status().running {
+                    return Err(bad(c, "cannot change the SAM 3 model folder while its download is running"));
+                }
+                let dir = str_param(p, "dir").ok_or_else(|| bad(c, "dir must be an existing SAM 3 model folder"))?;
+                let dir = std::path::PathBuf::from(dir).canonicalize().map_err(|e| bad(c, format!("could not open model folder: {e}")))?;
+                if !dir.is_dir() {
+                    return Err(bad(c, "the selected model path is not a folder"));
+                }
+                for file in ["model.safetensors", "vocab.json", "merges.txt"] {
+                    let path = dir.join(file);
+                    let metadata = std::fs::metadata(&path).map_err(|_| bad(c, format!("model folder is missing required file {file}")))?;
+                    if !metadata.is_file() {
+                        return Err(bad(c, format!("model folder is missing required regular file {file}")));
+                    }
+                }
+                s.segmenter.dir = Some(dir.clone());
+                Ok(json!({"dir": dir.to_string_lossy(), "installed": true}))
+            }
+        ),
+        cmd!(
             query "segment.model.download",
             "Download AI Mask Model",
             [],

@@ -5,6 +5,9 @@ edition.workspace = true
 license = "Apache-2.0"
 description = "LightCraft segmentation: SAM 3 (Segment Anything with Concepts) inference in pure Rust (L3)"
 
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
 [lints]
 workspace = true
 

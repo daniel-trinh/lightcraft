@@ -39,6 +39,7 @@ lightcraft-inpaint = { workspace = true, optional = true }
 # AI masks with SAM 3 (Object / Describe). Off for the web and CLI builds.
 sam = ["dep:lightcraft-segment"]
 inpaint = ["dep:lightcraft-inpaint"]
+cuda = ["inpaint", "lightcraft-inpaint/cuda", "lightcraft-segment?/cuda"]
 
 [dev-dependencies]
 libc = { workspace = true }

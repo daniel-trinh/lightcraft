@@ -233,6 +233,9 @@ fn services() -> Services {
         pick_folder: Some(Box::new(|| {
             rfd::FileDialog::new().set_title(lightcraft_ui_egui::i18n::tr("Open Library")).pick_folder().map(|p| p.to_string_lossy().to_string())
         })),
+        pick_sam_model_folder: Some(Box::new(|| {
+            rfd::FileDialog::new().set_title("Choose SAM 3 Model Folder").pick_folder().map(|p| p.to_string_lossy().to_string())
+        })),
         open_with: Some(Box::new(|path: &str, app: &str| {
             // spawned, never waited for: the editor runs alongside
             let app = app.trim();
@@ -507,14 +510,19 @@ fn main() -> eframe::Result {
             let (mut session, problem) = open_session(in_memory, library_dir, seed_demo && files.is_empty());
             // AI masks: the SAM 3 checkpoint (facebook/sam3) in <config>/models/sam3, or LIGHTCRAFT_SAM3_DIR
             // (never required: without it, AI masks offer to download it; see docs/ai-masks.md)
-            session.segmenter.dir =
-                std::env::var_os("LIGHTCRAFT_SAM3_DIR").map(std::path::PathBuf::from).or_else(|| config_dir().map(|d| d.join("models").join("sam3")));
             // the user's own download locations, one base URL per line (LIGHTCRAFT_SAM3_MIRRORS too)
             session.segmenter.mirrors_file = config_dir().map(|d| d.join("models").join("sam3-mirrors.txt"));
             let mut app = LightcraftApp::new(session, services());
             if let Some(ui) = prefs {
                 app.ui = ui;
             }
+            app.session.segmenter.dir = std::env::var_os("LIGHTCRAFT_SAM3_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    let saved = app.ui.settings.sam_model_dir.trim();
+                    (!saved.is_empty()).then(|| std::path::PathBuf::from(saved))
+                })
+                .or_else(|| config_dir().map(|d| d.join("models").join("sam3")));
             lightcraft_ui_egui::i18n::set_language(app.ui.language);
             app.integrated_titlebar = cfg!(target_os = "macos");
             app.notices.extend(prefs_warning);

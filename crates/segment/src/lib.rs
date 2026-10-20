@@ -86,13 +86,24 @@ pub fn is_model_dir(dir: &Path) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// The best device here: Metal on macOS (when a GPU is available), else the CPU.
-pub fn best_device() -> Device {
-    #[cfg(target_os = "macos")]
-    if let Ok(d) = Device::new_metal(0) {
-        return d;
+/// CUDA in GPU builds; Metal on macOS when available, otherwise CPU.
+pub fn best_device() -> Result<Device> {
+    if std::env::var("LIGHTCRAFT_AI_DEVICE").as_deref() == Ok("cpu") {
+        return Ok(Device::Cpu);
     }
-    Device::Cpu
+    #[cfg(feature = "cuda")]
+    {
+        Device::new_cuda(0)
+            .map_err(|e| Error::Model(format!("Cannot initialize the NVIDIA GPU: {e}. Check the packaged CUDA libraries and NVIDIA driver.")))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        #[cfg(target_os = "macos")]
+        if let Ok(d) = Device::new_metal(0) {
+            return Ok(d);
+        }
+        Ok(Device::Cpu)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -129,7 +140,7 @@ impl Sam3 {
     /// Load from a directory holding `model.safetensors` (the `facebook/sam3` checkpoint in
     /// Hugging Face format), `vocab.json` and `merges.txt`.
     pub fn load(dir: &Path) -> Result<Self> {
-        Self::load_on(dir, best_device())
+        Self::load_on(dir, best_device()?)
     }
 
     pub fn load_on(dir: &Path, device: Device) -> Result<Self> {

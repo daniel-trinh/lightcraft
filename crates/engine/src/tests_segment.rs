@@ -74,6 +74,39 @@ fn status_and_model_commands_without_the_model() {
 }
 
 #[test]
+fn selecting_model_directory_validates_before_replacing_current_directory() {
+    let mut s = Session::with_demo();
+    let previous = tmp("previous-model-dir");
+    std::fs::create_dir_all(&previous).unwrap();
+    s.segmenter.dir = Some(previous.clone());
+
+    let invalid = tmp("invalid-model-dir");
+    std::fs::create_dir_all(&invalid).unwrap();
+    std::fs::write(invalid.join("model.safetensors"), b"weights").unwrap();
+    let error = s.execute("segment.model.useDirectory", &json!({"dir": invalid})).unwrap_err().to_string();
+    assert_eq!(s.segmenter.dir.as_deref(), Some(previous.as_path()), "a failed selection must preserve the active path");
+
+    if !Segmenter::AVAILABLE {
+        assert!(error.contains("not available"), "{error}");
+    } else {
+        assert!(error.contains("vocab.json"), "{error}");
+        let valid = tmp("valid-model-dir");
+        std::fs::create_dir_all(&valid).unwrap();
+        for file in ["model.safetensors", "vocab.json", "merges.txt"] {
+            std::fs::write(valid.join(file), b"test fixture").unwrap();
+        }
+        let canonical = valid.canonicalize().unwrap();
+        let result = s.execute("segment.model.useDirectory", &json!({"dir": valid})).unwrap();
+        assert_eq!(result["dir"], canonical.to_string_lossy().as_ref());
+        assert_eq!(result["installed"], true);
+        assert_eq!(s.segmenter.dir.as_deref(), Some(canonical.as_path()));
+        let _ = std::fs::remove_dir_all(valid);
+    }
+    let _ = std::fs::remove_dir_all(previous);
+    let _ = std::fs::remove_dir_all(invalid);
+}
+
+#[test]
 fn ai_presets_replay_without_a_model_and_keep_background_inversion() {
     use lightcraft_develop::{MaskOp, MaskShape, SegMask};
     let mut s = Session::with_demo();
