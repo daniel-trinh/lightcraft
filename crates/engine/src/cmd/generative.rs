@@ -76,6 +76,10 @@ pub fn import_generated(s: &mut Session, original: PhotoId, path: &str) -> Resul
     let _ = s.execute("stack.group", &json!({"ids": [id, original.0], "top": id, "collapsed": false}));
     s.merge_undo(s.undo.len().saturating_sub(undo_before), "Generative Edit");
     s.selection = crate::Selection::single(PhotoId(id));
+    // The generated PNG is a separate photo with its own develop state. Selection-local mask
+    // and spot indices belong to the source photo and must not carry over to this new record.
+    s.active_mask = None;
+    s.active_spot = None;
     Ok(json!({"id": id, "path": path, "original": original.0}))
 }
 
@@ -351,6 +355,13 @@ mod tests {
     fn generated_photo_import_is_one_undo_step_and_keeps_source() {
         let mut s = Session::with_demo();
         let source = s.active().unwrap();
+        s.execute("mask.add", &json!({"kind": "radial", "center": [0.5, 0.5], "rx": 0.2, "ry": 0.2})).unwrap();
+        s.execute("spot.add", &json!({"points": [[0.4, 0.4], [0.45, 0.45]]})).unwrap();
+        let source_develop = s.develop_of(source).unwrap();
+        let source_mask_count = source_develop.masks.len();
+        let source_spot_count = source_develop.spots.len();
+        assert!(source_mask_count > 0 && source_spot_count > 0);
+        assert!(s.active_mask.is_some() && s.active_spot.is_some());
         let folder = std::env::temp_dir().join(format!("lightcraft-generative-import-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("generated.png");
@@ -362,10 +373,20 @@ mod tests {
         let generated = PhotoId(result["id"].as_u64().unwrap());
         assert!(s.catalog.photo(source).is_some());
         assert!(s.catalog.photo(generated).is_some());
+        assert_eq!(s.active(), Some(generated));
+        assert_eq!(s.selection.ids, vec![generated]);
+        assert_eq!(s.active_mask, None);
+        assert_eq!(s.active_spot, None);
+        let source_after = s.develop_of(source).unwrap();
+        assert_eq!(*source_after, *source_develop, "generative import must retain all source settings");
+        let generated_develop = s.develop_of(generated).unwrap();
+        assert!(generated_develop.masks.is_empty(), "the imported result has no source masks");
+        assert!(generated_develop.spots.is_empty(), "the imported result has no source spots");
         assert_eq!(s.undo.len(), undo_before + 1);
         s.execute("edit.undo", &json!({})).unwrap();
         assert!(s.catalog.photo(generated).is_none());
         assert!(s.catalog.photo(source).is_some());
+        assert_eq!(*s.develop_of(source).unwrap(), *source_develop, "undo leaves the source photo unchanged");
         assert!(path.exists(), "the generated file remains recoverable after undo");
         let _ = std::fs::remove_dir_all(folder);
     }
