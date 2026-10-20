@@ -7,7 +7,7 @@ use std::io::Read;
 use super::{CommandSpec, bad, cmd, has_active};
 use crate::{
     Result, Session,
-    generative::{Backend, Options, REMOVE_MASK_MARGIN},
+    generative::{Backend, Operation, Options, REMOVE_MASK_MARGIN},
 };
 
 fn options_for(p: &Value, remove: bool) -> Result<Options> {
@@ -25,6 +25,7 @@ fn options_for(p: &Value, remove: bool) -> Result<Options> {
         None => 0,
     };
     let o = Options {
+        operation: if remove { Operation::Remove } else { Operation::Fill },
         backend,
         endpoint: p.get("endpoint").and_then(Value::as_str).unwrap_or("http://127.0.0.1:8188").to_string(),
         checkpoint: p.get("checkpoint").and_then(Value::as_str).unwrap_or_default().to_string(),
@@ -88,7 +89,7 @@ fn run(s: &mut Session, p: &Value, remove: bool) -> Result<Value> {
     let id = s.active().ok_or_else(|| bad(c, "no active photo"))?;
     let mask = p.get("maskId").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad(c, "choose a maskId"))?;
     let mut opts = options_for(p, remove)?;
-    if remove {
+    if remove && opts.backend == Backend::Comfy {
         (opts.prompt, opts.negative) = crate::generative::removal_prompts(&opts.negative);
     }
     let job = s.plan_generative(id, mask, opts, p.get("dir").and_then(Value::as_str)).map_err(|e| bad(c, e))?;
@@ -126,7 +127,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Generative Remove",
             [],
             None,
-            "{maskId, backend?: native|comfy (native default), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512 (native model patch size; output stays full resolution), denoise?: 0.99 native|1 comfy, maskMargin?: 0..64 (native default 32), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — remove the selected area using background-matching prompts, saving a separate PNG and library photo → {id, path, original}",
+            "{maskId, backend?: native|comfy (native default), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512 (native model patch size; output stays full resolution), denoise?: 0.99 native|1 comfy, maskMargin?: 0..64 (native default 0), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — remove the selected area with bundled MI-GAN (native) or background prompts (ComfyUI); native ignores diffusion settings, saving a separate PNG and library photo → {id, path, original}",
             has_active,
             remove
         ),
@@ -151,6 +152,9 @@ mod tests {
     #[test]
     fn native_defaults_to_partial_denoise_and_comfy_keeps_full_strength() {
         let native = options_for(&json!({}), false).unwrap();
+        assert_eq!(native.operation, Operation::Fill);
+        assert_eq!(options_for(&json!({}), true).unwrap().operation, Operation::Remove);
+        assert!(options_for(&json!({"edge":256}), true).is_err());
         assert_eq!(native.backend, Backend::Native);
         assert!((native.denoise - 0.99).abs() < 0.0001);
         assert_eq!(native.mask_margin, 0);
@@ -168,13 +172,14 @@ mod tests {
     /// come from the procedural demo library. Normal CI does not need multi-GB model files.
     #[cfg(all(feature = "inpaint", not(target_arch = "wasm32")))]
     #[test]
-    #[ignore = "requires LIGHTCRAFT_INPAINT_TEST_MODEL and LIGHTCRAFT_INPAINT_TEST_OUTPUT"]
+    #[ignore = "requires LIGHTCRAFT_INPAINT_TEST_MODEL, LIGHTCRAFT_MIGAN_TEST_MODEL and LIGHTCRAFT_INPAINT_TEST_OUTPUT"]
     fn native_fill_and_remove_with_pinned_checkpoint() {
         let model = std::env::var_os("LIGHTCRAFT_INPAINT_TEST_MODEL").expect("model directory");
         let output = std::path::PathBuf::from(std::env::var_os("LIGHTCRAFT_INPAINT_TEST_OUTPUT").expect("output directory"));
         std::fs::create_dir_all(&output).unwrap();
         let mut s = Session::with_demo();
         s.generator.dir = Some(model.into());
+        s.generator.removal = Some(std::env::var_os("LIGHTCRAFT_MIGAN_TEST_MODEL").expect("removal model file").into());
         assert!(s.generator.installed());
         let source = s.active().unwrap();
         s.execute("photo.rotateRight", &json!({})).unwrap();
@@ -209,7 +214,8 @@ mod tests {
             s.active_mask = Some(mid);
             let before = s.undo.len();
             let started = std::time::Instant::now();
-            let r = s.execute(command,&json!({"maskId":mid,"edge":256,"steps":16,"seed":42,"prompt":"yellow flowers growing beside a mountain lake, natural photograph","negative":"red square, text, watermark","dir":output})).unwrap();
+            let edge = if command == "photo.generativeRemove" { 512 } else { 256 };
+            let r = s.execute(command,&json!({"maskId":mid,"edge":edge,"steps":16,"seed":42,"prompt":"yellow flowers growing beside a mountain lake, natural photograph","negative":"red square, text, watermark","dir":output})).unwrap();
             eprintln!("{command}: {:.2}s -> {}", started.elapsed().as_secs_f64(), r["path"]);
             let path = r["path"].as_str().unwrap();
             let bytes = std::fs::read(path).unwrap();

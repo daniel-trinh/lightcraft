@@ -81,6 +81,7 @@ pub struct GenerationSignals {
 
 pub struct Generator {
     pub dir: Option<PathBuf>,
+    pub removal: Option<PathBuf>,
     download: Arc<DownloadShared>,
     generation_cancel: Arc<AtomicBool>,
     generation_progress: Arc<GenerationProgress>,
@@ -92,6 +93,9 @@ impl Default for Generator {
             dir: std::env::var_os("LIGHTCRAFT_INPAINT_DIR")
                 .map(PathBuf::from)
                 .or_else(|| crate::camera_profiles::config_dir().map(|d| d.join("models/sd15-inpaint"))),
+            removal: std::env::var_os("LIGHTCRAFT_MIGAN_MODEL")
+                .map(PathBuf::from)
+                .or_else(|| std::env::current_exe().ok()?.parent().map(|dir| dir.join("models/migan-f32.safetensors"))),
             download: Arc::default(),
             generation_cancel: Arc::default(),
             generation_progress: Arc::default(),
@@ -101,6 +105,22 @@ impl Default for Generator {
 
 impl Generator {
     pub const AVAILABLE: bool = cfg!(feature = "inpaint");
+
+    /// Portable releases carry the small removal model beside the executable.
+    /// An explicit path is available for developers; working-directory lookup is avoided.
+    pub fn removal_model(&self) -> Result<PathBuf, String> {
+        if !Self::AVAILABLE {
+            return Err("Native removal is not available in this build".into());
+        }
+        let path = self.removal.clone().ok_or("Cannot locate the bundled removal model")?;
+        let metadata = std::fs::metadata(&path).map_err(|_| {
+            format!("Removal model is missing: {}. Extract the complete portable package, including its models folder.", path.display())
+        })?;
+        if !metadata.is_file() || metadata.len() != 29_528_324 {
+            return Err("The bundled removal model is incomplete or invalid; extract the portable package again".into());
+        }
+        Ok(path)
+    }
 
     pub fn installed(&self) -> bool {
         #[cfg(feature = "inpaint")]
@@ -117,7 +137,7 @@ impl Generator {
         if self.installed() {
             Ok(dir)
         } else {
-            Err(format!("{NOT_INSTALLED}. Use the Download model button in Remove, or install the pinned files in {}.", dir.display()))
+            Err(format!("{NOT_INSTALLED}. Use the Fill model download button, or install the pinned files in {}.", dir.display()))
         }
     }
 

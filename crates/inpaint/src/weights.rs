@@ -25,6 +25,10 @@ pub struct Weights {
 }
 
 impl Weights {
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
+    }
+
     pub fn open(path: &Path) -> Result<Arc<Self>> {
         let mut file = File::open(path).map_err(|e| Error::Model(format!("{}: {e}", path.display())))?;
         let file_len = file.metadata()?.len();
@@ -47,8 +51,9 @@ impl Weights {
             }
             let dtype = match value.get("dtype").and_then(serde_json::Value::as_str) {
                 Some("F16") => DType::F16,
+                Some("F32") => DType::F32,
                 Some("I64") => DType::I64,
-                _ => return Err(Error::Model(format!("unsupported dtype for {name}; expected F16 or I64"))),
+                _ => return Err(Error::Model(format!("unsupported dtype for {name}; expected F16, F32 or I64"))),
             };
             let shape: Vec<usize> = value
                 .get("shape")
@@ -88,7 +93,7 @@ impl Weights {
         Ok(Arc::new(Self { file: Mutex::new(file), entries, data_start: header_len + 8 }))
     }
 
-    fn read(&self, name: &str, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+    pub(crate) fn read(&self, name: &str, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
         let entry = self.entries.get(name).ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {name}")))?;
         let mut data = vec![0u8; entry.len];
         let mut file = self.file.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -172,6 +177,23 @@ mod tests {
         assert_eq!(weights.read("weight", DType::F32, &Device::Cpu).unwrap().to_vec1::<f32>().unwrap(), [1.0, 2.0]);
         assert_eq!(weights.read("text_model.embeddings.position_ids", DType::I64, &Device::Cpu).unwrap().to_vec2::<i64>().unwrap(), [[0, 1]]);
         bytes.truncate(bytes.len() - 1);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(Weights::open(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn single_precision_tensor_loads_and_checks_extent() {
+        let path = std::env::temp_dir().join(format!("lc-inpaint-f32-{}.safetensors", std::process::id()));
+        let header = br#"{"weight":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&1.25f32.to_le_bytes());
+        bytes.extend_from_slice(&(-2.5f32).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let weights = Weights::open(&path).unwrap();
+        assert_eq!(weights.read("weight", DType::F32, &Device::Cpu).unwrap().to_vec1::<f32>().unwrap(), [1.25, -2.5]);
+        bytes.pop();
         std::fs::write(&path, &bytes).unwrap();
         assert!(Weights::open(&path).is_err());
         let _ = std::fs::remove_file(path);

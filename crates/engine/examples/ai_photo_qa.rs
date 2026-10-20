@@ -48,7 +48,8 @@ mod qa {
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Case {
         source: PathBuf,
-        model_dir: PathBuf,
+        model_dir: Option<PathBuf>,
+        removal_model: Option<PathBuf>,
         output_dir: PathBuf,
         command: String,
         mask: Value,
@@ -125,10 +126,17 @@ mod qa {
         if !source.is_file() {
             return Err(format!("source is not a regular file: {}", source.display()));
         }
-        let model_dir = fs::canonicalize(&case.model_dir).map_err(|e| format!("modelDir {}: {e}", case.model_dir.display()))?;
         let mut session = Session::new().with_fs();
-        session.generator.dir = Some(model_dir);
-        session.generator.model_dir().map_err(|e| format!("local model is unavailable: {e}"))?;
+        if case.command == "photo.generativeRemove" {
+            if let Some(path) = &case.removal_model {
+                session.generator.removal = Some(fs::canonicalize(path).map_err(|e| format!("removalModel {}: {e}", path.display()))?);
+            }
+            session.generator.removal_model().map_err(|e| format!("removal model is unavailable: {e}"))?;
+        } else {
+            let path = case.model_dir.as_deref().ok_or("Fill QA requires modelDir")?;
+            session.generator.dir = Some(fs::canonicalize(path).map_err(|e| format!("modelDir {}: {e}", path.display()))?);
+            session.generator.model_dir().map_err(|e| format!("local model is unavailable: {e}"))?;
+        }
         fs::create_dir_all(&case.output_dir).map_err(|e| format!("outputDir {}: {e}", case.output_dir.display()))?;
         let output_dir = fs::canonicalize(&case.output_dir).map_err(|e| format!("outputDir {}: {e}", case.output_dir.display()))?;
         let copied = copy_new(&source, &output_dir)?;

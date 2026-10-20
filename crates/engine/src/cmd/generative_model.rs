@@ -10,6 +10,8 @@ fn status(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({
         "available": Generator::AVAILABLE,
         "installed": s.generator.installed(),
+        "removalInstalled": s.generator.removal_model().is_ok(),
+        "removalModel": s.generator.removal.as_ref().map(|p| p.to_string_lossy()),
         "dir": s.generator.dir.as_ref().map(|d| d.to_string_lossy()),
         "download": s.generator.download_status(),
         "license": LICENSE_NAME,
@@ -72,6 +74,21 @@ pub fn specs() -> Vec<CommandSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "inpaint")]
+    #[test]
+    fn bundled_removal_availability_does_not_depend_on_fill_download() {
+        let mut s = Session::with_demo();
+        s.generator.dir = None;
+        let path = std::env::temp_dir().join(format!("lc-removal-status-{}.safetensors", std::process::id()));
+        std::fs::File::create(&path).unwrap().set_len(29_528_324).unwrap();
+        s.generator.removal = Some(path.clone());
+        let state = status(&mut s, &json!({})).unwrap();
+        assert_eq!(state["installed"], false);
+        assert_eq!(state["removalInstalled"], true);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(status(&mut s, &json!({})).unwrap()["removalInstalled"], false);
+    }
 
     #[test]
     fn model_download_requires_explicit_acknowledgement() {

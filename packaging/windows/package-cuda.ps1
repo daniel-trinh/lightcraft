@@ -10,10 +10,17 @@
 #>
 param(
   [Parameter(Mandatory = $true)][string] $CudaRoot,
+  [Parameter(Mandatory = $true)][string] $MiganModel,
   [Parameter(Mandatory = $true)][string] $OutDir
 )
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$MiganModel = (Resolve-Path -LiteralPath $MiganModel -ErrorAction Stop).Path
+$miganHash = '365c3680e7e33b140761d11a0e62d7ed596572d036bbc3e670540c2baaf9c845'
+if ((Get-Item -LiteralPath $MiganModel).Length -ne 29528324 -or
+    (Get-FileHash -LiteralPath $MiganModel -Algorithm SHA256).Hash.ToLowerInvariant() -ne $miganHash) {
+  throw 'Removal model does not match the pinned converted MI-GAN checkpoint. See docs/migan-model.md.'
+}
 $CudaRoot = (Resolve-Path -LiteralPath $CudaRoot -ErrorAction Stop).Path
 $env:CUDA_ROOT = $CudaRoot
 $env:CUDA_PATH = $CudaRoot
@@ -111,6 +118,15 @@ $portable = Join-Path $stage 'LightCraft-CUDA-portable'
 try {
   New-Item -ItemType Directory -Path $portable -Force | Out-Null
   Copy-Item -LiteralPath $exe -Destination $portable
+  $modelFolder = Join-Path $portable 'models'
+  New-Item -ItemType Directory -Path $modelFolder | Out-Null
+  Copy-Item -LiteralPath $MiganModel -Destination (Join-Path $modelFolder 'migan-f32.safetensors')
+  $modelLicenses = Join-Path $modelFolder 'licenses'
+  New-Item -ItemType Directory -Path $modelLicenses | Out-Null
+  foreach ($license in @('MI-GAN-LICENSE.txt', 'MI-GAN-LICENSE-WEIGHTS.txt')) {
+    Copy-Item -LiteralPath (Join-Path $Root "docs/licenses/$license") -Destination $modelLicenses
+  }
+  Copy-Item -LiteralPath (Join-Path $Root 'docs/migan-model.md') -Destination (Join-Path $modelFolder 'PROVENANCE.md')
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README-CUDA.txt') -Destination (Join-Path $portable 'START-HERE.txt')
   foreach ($dll in $requiredDlls) { Copy-Item -LiteralPath $runtime[$dll] -Destination (Join-Path $portable $dll) }
   foreach ($file in @('README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE')) {

@@ -7,11 +7,12 @@ recorded in SHA256-MANIFEST.json; the default build targets the RTX 4090 (8.9).
 
 Fill and Remove
 1. Import a photo and create a mask around the area to change.
-2. Open Remove. Read the model licence, then choose Download model.
-   The one-time download is approximately 2.13 GB and can be resumed.
-3. Enter a replacement prompt and choose Fill. Choose Remove to reconstruct the
-   background; Remove does not use that prompt. The result appears as a new photo
-   beside its source.
+2. Open Remove and choose Remove to reconstruct the background. Its small
+   MIT-licensed model is included in the models folder; no download is needed.
+3. For prompt-based Fill, read the model licence, then choose Download model.
+   The one-time Fill download is approximately 2.13 GB and can be resumed.
+   Enter a replacement prompt and choose Fill. Each result appears as a new photo
+   beside its source. Neither operation uploads your photo.
 
 AI masks
 SAM 3 model access is managed by Meta at https://huggingface.co/facebook/sam3.
@@ -24,5 +25,6 @@ uploaded to an AI service. Generative results can contain mistakes: inspect each
 result before exporting. Your source photo is retained. Undo removes a generated
 photo from the catalog while keeping its PNG on disk for recovery.
 
-Keep the bundled licence files with this package. AI model weights have their
-own licences, shown during setup, and are not included in the ZIP.
+Keep the bundled licence files with this package. The included MI-GAN removal
+weights have an MIT licence in models/licenses. Fill and SAM weights have their
+own licences and are obtained separately during setup.

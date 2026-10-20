@@ -22,11 +22,12 @@ const MAX_RESPONSE: usize = 64 * 1024 * 1024;
 const MAX_EDGE: usize = 2048;
 const NATIVE_MAX_EDGE: usize = 512;
 const MAX_NATIVE_PIXELS: usize = 64_000_000;
-pub const REMOVE_MASK_MARGIN: usize = 32;
+pub const REMOVE_MASK_MARGIN: usize = 0;
 static NEXT_NAME: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 pub struct Options {
+    pub operation: Operation,
     pub backend: Backend,
     pub endpoint: String,
     pub checkpoint: String,
@@ -47,6 +48,12 @@ pub enum Backend {
     Comfy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Fill,
+    Remove,
+}
+
 impl Options {
     pub fn validate(&self) -> Result<(), String> {
         if self.mask_margin > 64 {
@@ -63,6 +70,9 @@ impl Options {
         }
         match self.backend {
             Backend::Native => {
+                if self.operation == Operation::Remove && self.edge != 512 {
+                    return Err("native removal uses a fixed 512-pixel model canvas".into());
+                }
                 if !self.denoise.is_finite() || !(0.0..=1.0).contains(&self.denoise) || self.denoise == 0.0 {
                     return Err("native denoise must be greater than 0 and no more than 1".into());
                 }
@@ -128,7 +138,10 @@ impl Session {
             Backend::Native => {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    Some(self.generator.model_dir()?)
+                    Some(match options.operation {
+                        Operation::Fill => self.generator.model_dir()?,
+                        Operation::Remove => self.generator.removal_model()?,
+                    })
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -171,6 +184,59 @@ impl Session {
         let destination = unique_destination(&dir, &stem);
         Ok(Job { original: id, destination, options, image, mask, model_dir })
     }
+}
+
+/// Center the active, aspect-preserving patch on MI-GAN's fixed canvas. Image padding
+/// repeats the nearest edge; padding is known context and never part of the hole.
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn removal_canvas(patch: &Rgba8, mask: &[u8], roi: Roi) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if roi.active_w == 0
+        || roi.active_h == 0
+        || roi.active_w > 512
+        || roi.active_h > 512
+        || patch.width != roi.model_w
+        || patch.height != roi.model_h
+        || patch.width.checked_mul(patch.height) != Some(mask.len())
+    {
+        return Err("invalid removal patch dimensions".into());
+    }
+    let (left, top) = ((512 - roi.active_w) / 2, (512 - roi.active_h) / 2);
+    let mut rgb = Vec::with_capacity(512 * 512 * 3);
+    let mut holes = vec![0u8; 512 * 512];
+    for y in 0usize..512 {
+        for x in 0usize..512 {
+            let px = x.saturating_sub(left).min(roi.active_w - 1);
+            let py = y.saturating_sub(top).min(roi.active_h - 1);
+            rgb.extend_from_slice(patch.get(px, py).get(..3).ok_or("invalid removal pixel")?);
+            if x >= left && x < left + roi.active_w && y >= top && y < top + roi.active_h {
+                *holes.get_mut(y * 512 + x).ok_or("invalid removal canvas")? = *mask.get(py * patch.width + px).ok_or("invalid removal mask")?;
+            }
+        }
+    }
+    Ok((rgb, holes))
+}
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn removal_crop(canvas: &[u8], roi: Roi) -> Result<Vec<u8>, String> {
+    if canvas.len() != 512 * 512 * 3
+        || roi.active_w == 0
+        || roi.active_h == 0
+        || roi.active_w > 512
+        || roi.active_h > 512
+        || roi.model_w > 512
+        || roi.model_h > 512
+    {
+        return Err("invalid removal output dimensions".into());
+    }
+    let (left, top) = ((512 - roi.active_w) / 2, (512 - roi.active_h) / 2);
+    let mut rgb = Vec::with_capacity(roi.model_w * roi.model_h * 3);
+    for y in 0..roi.model_h {
+        for x in 0..roi.model_w {
+            let offset = ((top + y.min(roi.active_h - 1)) * 512 + left + x.min(roi.active_w - 1)) * 3;
+            rgb.extend_from_slice(canvas.get(offset..offset + 3).ok_or("invalid removal output pixel")?);
+        }
+    }
+    Ok(rgb)
 }
 
 fn unique_destination(dir: &Path, stem: &str) -> PathBuf {
@@ -224,10 +290,6 @@ impl Job {
                     if cancel.load(Ordering::Relaxed) {
                         return Err("generation cancelled".into());
                     }
-                    let mut model = lightcraft_inpaint::Model::load(model_dir).map_err(|e| format!("could not load local inpainting model: {e}"))?;
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err("generation cancelled".into());
-                    }
                     let roi = selected_roi(&mask, self.options.edge).ok_or("the selected mask has no visible area")?;
                     let patch = roi_patch(&image, roi);
                     let mut rgb = Vec::with_capacity(patch.width * patch.height * 3);
@@ -236,34 +298,59 @@ impl Job {
                     }
                     let mut mask8 = roi_mask8(&mask, roi);
                     dilate_mask8(&mut mask8, patch.width, patch.height, self.options.mask_margin)?;
-                    eprintln!(
-                        "Lightcraft inpaint: device={}, full={}x{}, ROI=({}, {}) {}x{}, model={}x{}, maskMargin={}",
-                        model.device_description(),
-                        image.width,
-                        image.height,
-                        roi.x,
-                        roi.y,
-                        roi.w,
-                        roi.h,
-                        patch.width,
-                        patch.height,
-                        self.options.mask_margin
-                    );
-                    let native_options = lightcraft_inpaint::GenerateOptions {
-                        prompt: if self.options.prompt.trim().is_empty() {
-                            "clean natural background matching the surrounding image".into()
-                        } else {
-                            self.options.prompt.clone()
-                        },
-                        negative: self.options.negative.clone(),
-                        seed: self.options.seed,
-                        steps: self.options.steps as usize,
-                        guidance: self.options.guidance,
-                        strength: self.options.denoise,
+                    let pixels = if self.options.operation == Operation::Remove {
+                        let model =
+                            lightcraft_inpaint::migan::Migan::load_local(model_dir).map_err(|e| format!("could not load removal model: {e}"))?;
+                        eprintln!(
+                            "Lightcraft removal: model=MI-GAN, device={}, full={}x{}, ROI=({}, {}) {}x{}, canvas=512x512, maskMargin={}",
+                            model.device_description(),
+                            image.width,
+                            image.height,
+                            roi.x,
+                            roi.y,
+                            roi.w,
+                            roi.h,
+                            self.options.mask_margin
+                        );
+                        let (canvas, canvas_mask) = removal_canvas(&patch, &mask8, roi)?;
+                        let generated = model.generate_rgb8(&canvas, &canvas_mask, cancel).map_err(|e| format!("local removal failed: {e}"))?;
+                        progress(1, 1);
+                        removal_crop(&generated, roi)?
+                    } else {
+                        let mut model =
+                            lightcraft_inpaint::Model::load(model_dir).map_err(|e| format!("could not load local inpainting model: {e}"))?;
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("generation cancelled".into());
+                        }
+                        eprintln!(
+                            "Lightcraft inpaint: device={}, full={}x{}, ROI=({}, {}) {}x{}, model={}x{}, maskMargin={}",
+                            model.device_description(),
+                            image.width,
+                            image.height,
+                            roi.x,
+                            roi.y,
+                            roi.w,
+                            roi.h,
+                            patch.width,
+                            patch.height,
+                            self.options.mask_margin
+                        );
+                        let native_options = lightcraft_inpaint::GenerateOptions {
+                            prompt: if self.options.prompt.trim().is_empty() {
+                                "clean natural background matching the surrounding image".into()
+                            } else {
+                                self.options.prompt.clone()
+                            },
+                            negative: self.options.negative.clone(),
+                            seed: self.options.seed,
+                            steps: self.options.steps as usize,
+                            guidance: self.options.guidance,
+                            strength: self.options.denoise,
+                        };
+                        model
+                            .generate(&rgb, &mask8, patch.width, patch.height, &native_options, cancel, &mut progress)
+                            .map_err(|e| format!("native inpainting failed: {e}"))?
                     };
-                    let pixels = model
-                        .generate(&rgb, &mask8, patch.width, patch.height, &native_options, cancel, &mut progress)
-                        .map_err(|e| format!("native inpainting failed: {e}"))?;
                     if pixels.len() != patch.width.saturating_mul(patch.height).saturating_mul(3) {
                         return Err("native inpainting returned an invalid image size".into());
                     }
@@ -340,6 +427,9 @@ impl Job {
             return Err("generation cancelled".into());
         }
         let output = png(&image)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("generation cancelled".into());
+        }
         let path = lightcraft_catalog::safe_file::write_new_unique(
             &mut (0u32..).map(|n| {
                 if n == 0 {
@@ -747,6 +837,7 @@ mod tests {
     #[test]
     fn stock_comfy_graph_has_inpaint_path() {
         let o = Options {
+            operation: Operation::Fill,
             backend: Backend::Comfy,
             endpoint: "http://127.0.0.1:8188".into(),
             checkpoint: "inpaint.safetensors".into(),
@@ -764,6 +855,25 @@ mod tests {
         assert_eq!(g["6"]["class_type"], "InpaintModelConditioning");
         assert_eq!(g["6"]["inputs"]["mask"], json!(["2", 0]));
         assert_eq!(g["9"]["inputs"]["images"], json!(["8", 0]));
+    }
+
+    #[test]
+    fn removal_letterbox_round_trips_rectangular_patch_without_selecting_padding() {
+        let roi = Roi { x: 0, y: 0, w: 1200, h: 600, active_w: 512, active_h: 256, model_w: 512, model_h: 256 };
+        let patch = Rgba8::from_fn(512, 256, |x, y| [x as u8, y as u8, 37, 255]);
+        let mut mask = vec![0; 512 * 256];
+        mask[0] = 255;
+        mask[255 * 512 + 511] = 255;
+        let (canvas, holes) = removal_canvas(&patch, &mask, roi).unwrap();
+        assert_eq!(holes.iter().filter(|&&v| v > 0).count(), 2);
+        assert_eq!(holes[128 * 512], 255);
+        assert_eq!(holes[383 * 512 + 511], 255);
+        assert!(holes[..128 * 512].iter().all(|&v| v == 0));
+        assert_eq!(&canvas[..3], &[0, 0, 37]);
+        let cropped = removal_crop(&canvas, roi).unwrap();
+        let expected: Vec<u8> = patch.data.iter().flat_map(|pixel| pixel[..3].iter().copied()).collect();
+        assert_eq!(cropped, expected);
+        assert!(removal_crop(&canvas[..12], roi).is_err());
     }
     #[test]
     fn generated_pixels_affect_only_selected_area() {
@@ -799,7 +909,7 @@ mod tests {
         let mut conditioning = roi_mask8(&mask, roi);
         let selected_before = conditioning.iter().filter(|&&px| px == 255).count();
         assert!(selected_before > 1000);
-        dilate_mask8(&mut conditioning, roi.model_w, roi.model_h, REMOVE_MASK_MARGIN).unwrap();
+        dilate_mask8(&mut conditioning, roi.model_w, roi.model_h, 32).unwrap();
         assert!(conditioning.iter().filter(|&&px| px == 255).count() > selected_before);
         let generated = Rgba8::filled(roi.model_w, roi.model_h, [250, 10, 20, 255]);
         composite_roi(&mut image, &generated, &mask, roi);
@@ -946,6 +1056,7 @@ mod tests {
     #[test]
     fn native_generation_options_accept_partial_denoise_with_active_steps() {
         let options = Options {
+            operation: Operation::Fill,
             backend: Backend::Native,
             endpoint: String::new(),
             checkpoint: String::new(),

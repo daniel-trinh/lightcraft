@@ -362,8 +362,16 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         ui.label(format!("Inference: {}", lightcraft_engine::generative_model::backend_description()));
         let download = app.session.generator.download_status();
         let installed = app.session.generator.installed();
+        let removal = app.session.generator.removal_model();
+        if let Err(error) = &removal {
+            ui.label(error);
+        } else {
+            ui.label("Remove is ready: its model is included with the app.");
+        }
         if !installed {
-            ui.label("One-time setup: download the SD 1.5 inpainting model (about 2.2 GB). Lightcraft manages inference; no separate app is needed.");
+            ui.label(
+                "For prompt-based Fill, download the SD 1.5 model once (about 2.2 GB). Lightcraft manages inference; no separate app is needed.",
+            );
             ui.hyperlink_to("Read the model licence", lightcraft_engine::generative_model::LICENSE_URL);
             let r = ui.checkbox(&mut app.ui.generative_model_ack, "I accept the CreativeML OpenRAIL-M model licence");
             register(ui.ctx(), "checkbox:generativeModelConsent", r.rect);
@@ -396,7 +404,7 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         ui.label("Replacement prompt (Fill only)");
         let r = ui.text_edit_singleline(&mut app.ui.generative_prompt);
         register(ui.ctx(), "field:generativePrompt", r.rect);
-        ui.label("Negative prompt (optional)");
+        ui.label("Negative prompt (Fill only, optional)");
         let r = ui.text_edit_singleline(&mut app.ui.generative_negative);
         register(ui.ctx(), "field:generativeNegative", r.rect);
         if app.session.catalog.photo(id).is_some_and(|p| matches!(&p.source, lightcraft_catalog::Source::Demo { .. })) {
@@ -414,7 +422,7 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             .horizontal(|ui| {
                 let fill = ui.add_enabled(installed && selected.is_some() && !running, egui::Button::new("Fill"));
                 register(ui.ctx(), "button:generativeFill", fill.rect);
-                let remove = ui.add_enabled(installed && selected.is_some() && !running, egui::Button::new("Remove"));
+                let remove = ui.add_enabled(removal.is_ok() && selected.is_some() && !running, egui::Button::new("Remove"));
                 register(ui.ctx(), "button:generativeRemove", remove.rect);
                 (fill.clicked(), remove.clicked())
             })
@@ -424,7 +432,7 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             if total > 1 {
                 ui.add(egui::ProgressBar::new(step as f32 / total as f32).text(format!("Generating: step {step} of {total}")));
             } else {
-                ui.label("Preparing the local model and image…");
+                ui.label("Processing the image with the local model…");
             }
             let r = ui.button("Cancel generation");
             register(ui.ctx(), "button:generativeCancel", r.rect);
@@ -440,6 +448,11 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 (app.ui.generative_prompt.clone(), app.ui.generative_negative.clone())
             };
             let opts = lightcraft_engine::generative::Options {
+                operation: if remove_clicked {
+                    lightcraft_engine::generative::Operation::Remove
+                } else {
+                    lightcraft_engine::generative::Operation::Fill
+                },
                 backend: lightcraft_engine::generative::Backend::Native,
                 endpoint: String::new(),
                 checkpoint: String::new(),

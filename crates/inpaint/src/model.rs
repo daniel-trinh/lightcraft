@@ -72,13 +72,24 @@ pub struct Model {
     unet: unet_2d::UNet2DConditionModel,
 }
 
-fn best_device() -> Result<Device> {
+#[cfg(feature = "cuda")]
+static CUDA_DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
+
+pub(crate) fn best_device() -> Result<Device> {
     if std::env::var("LIGHTCRAFT_AI_DEVICE").as_deref() == Ok("cpu") {
         return Ok(Device::Cpu);
     }
     #[cfg(feature = "cuda")]
     {
-        Device::new_cuda(0).map_err(|e| Error::Model(format!("Cannot initialize the NVIDIA GPU: {e}. Use the packaged CUDA runtime libraries and an up-to-date NVIDIA driver. Set LIGHTCRAFT_AI_DEVICE=cpu only to explicitly select slower CPU inference.")))
+        if let Some(device) = CUDA_DEVICE.get() {
+            return Ok(device.clone());
+        }
+        let device = Device::new_cuda(0).map_err(|e| Error::Model(format!("Cannot initialize the NVIDIA GPU: {e}. Use the packaged CUDA runtime libraries and an up-to-date NVIDIA driver. Set LIGHTCRAFT_AI_DEVICE=cpu only to explicitly select slower CPU inference.")))?;
+        // Keep the CUDA context and lazily compiled kernels across jobs. Each job still
+        // releases its model tensors, avoiding persistent multi-GB checkpoint allocations.
+        // A failed initialization is not cached, so a later attempt can retry.
+        let _ = CUDA_DEVICE.set(device.clone());
+        Ok(CUDA_DEVICE.get().cloned().unwrap_or(device))
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -288,6 +299,16 @@ impl Noise {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires the packaged CUDA libraries and NVIDIA GPU"]
+    fn cuda_context_is_reused_between_jobs() {
+        let first = best_device().unwrap();
+        assert!(matches!(first, Device::Cuda(_)));
+        let second = best_device().unwrap();
+        assert!(first.same_device(&second));
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires packaged CUDA libraries, NVIDIA GPU, and LIGHTCRAFT_INPAINT_TEST_MODEL"]

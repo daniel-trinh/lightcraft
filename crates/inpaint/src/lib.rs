@@ -1,4 +1,4 @@
-//! Local Stable Diffusion 1.5 inpainting. The checkpoint is downloaded separately by the user.
+//! Local MI-GAN removal and Stable Diffusion 1.5 prompt-based inpainting.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -8,6 +8,8 @@ mod model;
 pub use model::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod download;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod migan;
 #[cfg(not(target_arch = "wasm32"))]
 mod tokenizer;
 #[cfg(not(target_arch = "wasm32"))]

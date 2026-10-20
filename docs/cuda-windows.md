@@ -4,8 +4,8 @@
 creates a portable folder plus ZIP. The target computer does not need Python, ComfyUI, a CUDA
 toolkit, or a separately launched service. The CUDA runtime DLLs are shipped beside
 `lightcraft.exe`; this is a portable folder, not a physically single-file executable. Users
-launch `lightcraft.exe` from the extracted folder. Model files are downloaded by the app when
-needed and are not included in the package.
+launch `lightcraft.exe` from the extracted folder. The MIT-licensed MI-GAN removal model is
+included under `models/`; the larger prompt-based Fill model is downloaded by the app when requested.
 
 ## Build
 
@@ -45,6 +45,7 @@ Example, from the LightCraft repository root:
 $env:CRAFT_FONTS_DIR = 'C:\src\craft-fonts'
 pwsh packaging/windows/package-cuda.ps1 `
   -CudaRoot 'C:\src\cuda-sdk' `
+  -MiganModel 'C:\src\models\migan-f32.safetensors' `
   -OutDir 'C:\releases\lightcraft-cuda-1.0.0'
 ```
 
@@ -53,5 +54,6 @@ directory next to the destination, then moves the completed folder into place. I
 delete or replace an existing destination. The output contains `LightCraft-CUDA-portable/` and
 `LightCraft-CUDA-portable.zip`.
 
-CUDA model weights are separate downloads. They are not bundled because their size and licensing
-terms are model-specific; the app-managed downloader obtains them when requested.
+Pass `-MiganModel` with the pinned, converted removal checkpoint described in
+[migan-model.md](migan-model.md). Packaging verifies its exact size and SHA-256 before copying
+it and its code/weight licences. The larger Fill checkpoint remains a separate app-managed download.

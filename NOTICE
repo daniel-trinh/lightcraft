@@ -34,6 +34,17 @@ context. crates/inpaint is therefore licensed under Apache-2.0 only (LICENSE-APA
 The SD 1.5 inpainting model weights are not distributed with LightCraft. Users download
 them separately under CreativeML OpenRAIL-M; see docs/generative-fill.md.
 
+crates/inpaint/src/migan.rs ports the MIT-licensed MI-GAN inference architecture
+from Picsart AI Research (PAIR), Copyright (c) 2024, at revision
+2b793c5ece43f4253e32d4afc257120a5deed6f5 of
+https://github.com/Picsart-AI-Research/MI-GAN. The port translates the inference
+operations to Rust/Candle and uses the author's fixed ONNX-export noise tensors.
+Portable CUDA packages include converted MI-GAN weights from revision
+406830d0fa60666da0071c342ad2fbc8f30c5c64 of
+https://huggingface.co/andraniksargsyan/migan. Both upstream code and weights have
+their own MIT licences; see docs/licenses/MI-GAN-LICENSE.txt and
+docs/licenses/MI-GAN-LICENSE-WEIGHTS.txt. Conversion/provenance: docs/migan-model.md.
+
 Builds made with craft-fonts (the optional CRAFT_FONTS_DIR build input; all official releases)
 also embed the fonts listed in https://github.com/storytold/craft-fonts/blob/main/ATTRIBUTION.md
 (the Japanese fonts BIZ UDPGothic, BIZ UDMincho and Shippori Mincho; the web build embeds only BIZ
