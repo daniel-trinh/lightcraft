@@ -863,6 +863,11 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
             _ => close = true,
         }
     }
+    // Continuing model setup can open the subject-description dialog. Keep that
+    // continuation instead of closing it together with the setup dialog.
+    if matches!(dlg, Dialog::SamModel { .. }) && matches!(app.ui.dialog, Some(Dialog::TextPrompt { .. })) {
+        return;
+    }
     app.ui.dialog = if close { None } else { Some(dlg) };
 }
 

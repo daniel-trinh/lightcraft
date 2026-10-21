@@ -15,6 +15,15 @@ Fill and Remove
    beside its source. Neither operation uploads your photo.
 
 AI masks
+Object selection can use the Apache-2.0 SAM 1 model with clicks to include and
+Alt-clicks to exclude. If models/sam1 is included, it is ready on a fresh launch;
+otherwise select SAM 1 in the Masking panel and choose Download Object model.
+The one-time download is 375 MB. No Hugging Face account is required for SAM 1.
+Existing preferences retain the chosen Object model.
+
+Describe and the AI presets (Sky, People, Subject, Background) use SAM 3.
+Subject and Background ask what to select (for example, person, rocket or cup).
+Background selects everything outside the described subject.
 SAM 3 model access is managed by Meta at https://huggingface.co/facebook/sam3.
 Once your access is approved, download model.safetensors, vocab.json, and
 merges.txt into one folder. In the AI model dialog choose Choose Model Folder.
@@ -26,5 +35,6 @@ result before exporting. Your source photo is retained. Undo removes a generated
 photo from the catalog while keeping its PNG on disk for recovery.
 
 Keep the bundled licence files with this package. The included MI-GAN removal
-weights have an MIT licence in models/licenses. Fill and SAM weights have their
-own licences and are obtained separately during setup.
+weights have an MIT licence in models/licenses. Bundled SAM 1 weights have an
+Apache-2.0 licence there too. Fill and SAM 3 have their own licences and are
+obtained separately during setup.

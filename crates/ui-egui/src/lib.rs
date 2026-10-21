@@ -387,7 +387,7 @@ impl LightcraftApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         let download = seg.download_status();
-        if download.running {
+        if download.running || seg.sam1_download_status().running {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
         // a download finishing while its dialog is closed: say so once

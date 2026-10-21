@@ -113,9 +113,14 @@ fn ai_presets_replay_without_a_model_and_keep_background_inversion() {
     let id = s.active().unwrap();
     let seg = serde_json::to_value(SegMask::from_logits(4, &[5.0; 16])).unwrap();
     for (kind, text, invert) in
-        [("aiSky", "sky", false), ("aiPeople", "person", false), ("aiSubject", "main subject", false), ("aiBackground", "main subject", true)]
+        [("aiSky", "sky", false), ("aiPeople", "person", false), ("aiSubject", "astronaut", false), ("aiBackground", "astronaut", true)]
     {
-        s.execute("mask.add", &json!({"kind": kind, "seg": seg})).unwrap();
+        let params = if matches!(kind, "aiSubject" | "aiBackground") {
+            json!({"kind": kind, "text": text, "seg": seg})
+        } else {
+            json!({"kind": kind, "seg": seg})
+        };
+        s.execute("mask.add", &params).unwrap();
         let d = s.develop_of(id).unwrap();
         let c = &d.masks.last().unwrap().components[0];
         assert_eq!(c.invert, invert);
@@ -127,11 +132,24 @@ fn ai_presets_replay_without_a_model_and_keep_background_inversion() {
     assert!(c.invert);
     assert_eq!(c.op, MaskOp::Intersect);
     assert!(matches!(&c.shape, MaskShape::Prompt { text, .. } if text == "dog"));
-    s.execute("mask.add", &json!({"kind": "aiBackground", "seg": seg, "invert": true})).unwrap();
+    s.execute("mask.add", &json!({"kind": "aiBackground", "text": "astronaut", "seg": seg, "invert": true})).unwrap();
     assert!(!s.develop_of(id).unwrap().masks.last().unwrap().components[0].invert);
     let before = s.develop_of(id).unwrap().masks.len();
     assert!(s.execute("mask.add", &json!({"kind": "aiSky", "text": "   ", "seg": seg})).is_err());
     assert_eq!(s.develop_of(id).unwrap().masks.len(), before);
+    for kind in ["aiSubject", "aiBackground"] {
+        for text in [None, Some(""), Some("   ")] {
+            let p = match text {
+                Some(text) => json!({"kind":kind,"text":text,"seg":seg}),
+                None => json!({"kind":kind,"seg":seg}),
+            };
+            let e = s.execute("mask.add", &p).unwrap_err().to_string();
+            assert!(e.contains("Describe the person or object"), "{e}");
+            assert_eq!(s.develop_of(id).unwrap().masks.len(), before);
+            let e = s.execute("mask.addComponent", &json!({"kind":kind,"op":"add","seg":seg})).unwrap_err().to_string();
+            assert!(e.contains("Describe the person or object"), "{e}");
+        }
+    }
     s.execute("mask.add", &json!({"kind": "radial", "invert": true})).unwrap();
     let d = s.develop_of(id).unwrap();
     let c = &d.masks.last().unwrap().components[0];
@@ -145,7 +163,8 @@ fn ai_presets_without_a_model_never_fall_back_to_heuristics() {
     let id = s.active().unwrap();
     s.segmenter.background = true;
     for kind in ["aiSky", "aiSubject", "aiBackground", "aiPeople"] {
-        assert!(s.execute("mask.add", &json!({"kind": kind})).is_err());
+        let p = if matches!(kind, "aiSubject" | "aiBackground") { json!({"kind":kind,"text":"astronaut"}) } else { json!({"kind":kind}) };
+        assert!(s.execute("mask.add", &p).is_err());
         assert!(s.develop_of(id).unwrap().masks.is_empty());
     }
     // The fast selections remain available independently.
@@ -299,7 +318,14 @@ fn object_clicks_are_capped() {
             name: None,
             op: lightcraft_develop::MaskOp::Add,
             invert: false,
-            shape: lightcraft_develop::MaskShape::Object { hint: many, exclude: vec![], seg: None, detail: vec![], edge: 0.0 },
+            shape: lightcraft_develop::MaskShape::Object {
+                model: lightcraft_develop::ObjectModel::Sam3,
+                hint: many,
+                exclude: vec![],
+                seg: None,
+                detail: vec![],
+                edge: 0.0,
+            },
         }],
         ..Default::default()
     });

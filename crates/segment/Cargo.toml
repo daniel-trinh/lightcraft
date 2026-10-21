@@ -6,7 +6,7 @@ license = "Apache-2.0"
 description = "LightCraft segmentation: SAM 3 (Segment Anything with Concepts) inference in pure Rust (L3)"
 
 [features]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [lints]
 workspace = true
@@ -21,8 +21,10 @@ log = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
 lightcraft-fetch = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { workspace = true, features = ["metal"] }
 candle-nn = { workspace = true, features = ["metal"] }
+candle-transformers = { workspace = true, features = ["metal"] }

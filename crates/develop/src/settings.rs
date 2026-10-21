@@ -731,6 +731,19 @@ impl Default for BrushStroke {
     }
 }
 
+/// Point-mask backend recorded with each Object component. Older documents used SAM 3.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ObjectModel {
+    #[default]
+    Sam3,
+    Sam1,
+}
+
+fn object_model_is_sam3(model: &ObjectModel) -> bool {
+    *model == ObjectModel::Sam3
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MaskShape {
@@ -775,6 +788,8 @@ pub enum MaskShape {
     /// One object picked by clicks (SAM 3 point prompts): `hint` holds the clicks that include,
     /// `exclude` the ones that exclude; `seg` the segmentation computed from them.
     Object {
+        #[serde(default, skip_serializing_if = "object_model_is_sam3")]
+        model: ObjectModel,
         hint: Vec<Point>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude: Vec<Point>,
@@ -915,4 +930,22 @@ pub struct Enhance {
     pub denoise: f64,
     pub raw_details: bool,
     pub super_resolution: bool,
+}
+
+#[cfg(test)]
+mod object_model_tests {
+    use super::*;
+
+    #[test]
+    fn old_object_documents_default_to_sam3_and_new_ones_record_sam1() {
+        let old = r#"{"kind":"object","hint":[],"exclude":[],"seg":null,"detail":[],"edge":0.0}"#;
+        let shape: MaskShape = serde_json::from_str(old).unwrap();
+        assert!(matches!(shape, MaskShape::Object { model: ObjectModel::Sam3, .. }));
+        let serialized = serde_json::to_string(&shape).unwrap();
+        assert!(!serialized.contains("\"model\""));
+        let new = old.replace("\"hint\"", "\"model\":\"sam1\",\"hint\"");
+        let shape: MaskShape = serde_json::from_str(&new).unwrap();
+        assert!(matches!(shape, MaskShape::Object { model: ObjectModel::Sam1, .. }));
+        assert!(serde_json::to_string(&shape).unwrap().contains("\"model\":\"sam1\""));
+    }
 }

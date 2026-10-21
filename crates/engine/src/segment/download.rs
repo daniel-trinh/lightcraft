@@ -107,7 +107,7 @@ impl Downloader {
         *lock(&s.text) = Text::default();
         *lock(&self.last) = Text::default();
         let guard = Running(s.clone());
-        let spawned = std::thread::Builder::new().name("sam3-download".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("ai-mask-download".into()).spawn(move || {
             let s = guard.0.clone();
             let mut last_file = String::new();
             let mut on_progress = |p: &Progress| {
@@ -123,14 +123,14 @@ impl Downloader {
             let error = match r {
                 Ok(Ok(())) => {
                     s.finished.store(true, Ordering::SeqCst);
-                    log::info!("SAM 3 model downloaded to {}", dir.display());
+                    log::info!("AI mask model downloaded to {}", dir.display());
                     None
                 }
                 Ok(Err(e)) => Some(e.to_string()),
                 Err(_) => Some("the download failed unexpectedly".to_string()),
             };
             if let Some(e) = &error {
-                log::warn!("SAM 3 download: {e}");
+                log::warn!("AI mask model download: {e}");
             }
             lock(&s.text).error = error;
             drop(guard);

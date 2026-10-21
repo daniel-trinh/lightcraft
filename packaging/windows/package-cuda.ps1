@@ -11,6 +11,7 @@
 param(
   [Parameter(Mandatory = $true)][string] $CudaRoot,
   [Parameter(Mandatory = $true)][string] $MiganModel,
+  [string] $Sam1Model,
   [Parameter(Mandatory = $true)][string] $OutDir
 )
 $ErrorActionPreference = 'Stop'
@@ -20,6 +21,13 @@ $miganHash = '365c3680e7e33b140761d11a0e62d7ed596572d036bbc3e670540c2baaf9c845'
 if ((Get-Item -LiteralPath $MiganModel).Length -ne 29528324 -or
     (Get-FileHash -LiteralPath $MiganModel -Algorithm SHA256).Hash.ToLowerInvariant() -ne $miganHash) {
   throw 'Removal model does not match the pinned converted MI-GAN checkpoint. See docs/migan-model.md.'
+}
+if ($Sam1Model) {
+  $Sam1Model = (Resolve-Path -LiteralPath $Sam1Model -ErrorAction Stop).Path
+  if ((Get-Item -LiteralPath $Sam1Model).Length -ne 374979376 -or
+      (Get-FileHash -LiteralPath $Sam1Model -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'fbf4c1ad844a2e9b867d89dc04a61f3ece19c57ebb7d8fcb6da92062a291d839') {
+    throw 'Object model does not match the pinned SAM 1 ViT-B safetensors checkpoint. See docs/sam1-model.md.'
+  }
 }
 $CudaRoot = (Resolve-Path -LiteralPath $CudaRoot -ErrorAction Stop).Path
 $env:CUDA_ROOT = $CudaRoot
@@ -127,6 +135,13 @@ try {
     Copy-Item -LiteralPath (Join-Path $Root "docs/licenses/$license") -Destination $modelLicenses
   }
   Copy-Item -LiteralPath (Join-Path $Root 'docs/migan-model.md') -Destination (Join-Path $modelFolder 'PROVENANCE.md')
+  if ($Sam1Model) {
+    $sam1Folder = Join-Path $modelFolder 'sam1'
+    New-Item -ItemType Directory -Path $sam1Folder | Out-Null
+    Copy-Item -LiteralPath $Sam1Model -Destination (Join-Path $sam1Folder 'sam_vit_b_01ec64.safetensors')
+    Copy-Item -LiteralPath (Join-Path $Root 'docs/licenses/SAM1-LICENSE.txt') -Destination $modelLicenses
+    Copy-Item -LiteralPath (Join-Path $Root 'docs/sam1-model.md') -Destination (Join-Path $sam1Folder 'PROVENANCE.md')
+  }
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README-CUDA.txt') -Destination (Join-Path $portable 'START-HERE.txt')
   foreach ($dll in $requiredDlls) { Copy-Item -LiteralPath $runtime[$dll] -Destination (Join-Path $portable $dll) }
   foreach ($file in @('README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE')) {

@@ -6,6 +6,8 @@ toolkit, or a separately launched service. The CUDA runtime DLLs are shipped bes
 `lightcraft.exe`; this is a portable folder, not a physically single-file executable. Users
 launch `lightcraft.exe` from the extracted folder. The MIT-licensed MI-GAN removal model is
 included under `models/`; the larger prompt-based Fill model is downloaded by the app when requested.
+The optional `-Sam1Model` argument also bundles the ungated click-selection checkpoint and
+its Apache-2.0 licence. Describe and semantic presets continue to use separately obtained SAM 3.
 
 ## Build
 
@@ -46,6 +48,7 @@ $env:CRAFT_FONTS_DIR = 'C:\src\craft-fonts'
 pwsh packaging/windows/package-cuda.ps1 `
   -CudaRoot 'C:\src\cuda-sdk' `
   -MiganModel 'C:\src\models\migan-f32.safetensors' `
+  -Sam1Model 'C:\src\models\sam_vit_b_01ec64.safetensors' `
   -OutDir 'C:\releases\lightcraft-cuda-1.0.0'
 ```
 
@@ -57,3 +60,5 @@ delete or replace an existing destination. The output contains `LightCraft-CUDA-
 Pass `-MiganModel` with the pinned, converted removal checkpoint described in
 [migan-model.md](migan-model.md). Packaging verifies its exact size and SHA-256 before copying
 it and its code/weight licences. The larger Fill checkpoint remains a separate app-managed download.
+`-Sam1Model` is optional; when provided, it must match the size and SHA-256 in
+[sam1-model.md](sam1-model.md). A mismatched file stops packaging before a release is built.

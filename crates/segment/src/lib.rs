@@ -37,6 +37,8 @@ pub mod mask;
 mod neck;
 #[cfg(not(target_arch = "wasm32"))]
 mod nn;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sam1;
 pub mod tokenizer;
 #[cfg(not(target_arch = "wasm32"))]
 mod tracker;
@@ -59,6 +61,8 @@ pub use tracker::Click;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("SAM 1 model: {0}")]
+    Sam1(String),
     #[error("SAM 3 model: {0}")]
     Model(String),
     #[error("SAM 3 model files not found in {0} (expected model.safetensors, vocab.json, merges.txt)")]

@@ -27,6 +27,11 @@ the facebook/sam3 checkpoint only when they choose to (in the app, or by hand), 
 License (https://github.com/facebookresearch/sam3/blob/main/LICENSE), a separate, non-OSI
 licence. See docs/ai-masks.md.
 
+crates/segment/src/sam1.rs uses Candle's Segment Anything implementation (MIT OR Apache-2.0).
+Portable packages may include the Apache-2.0 SAM 1 ViT-B weights, distributed by Kornia as
+safetensors with the original Meta tensor values. See docs/sam1-model.md and
+docs/licenses/SAM1-LICENSE.txt. The SA-1B dataset is not included.
+
 crates/inpaint (lightcraft-inpaint) uses Hugging Face Candle's Stable Diffusion APIs
 (https://github.com/huggingface/candle, MIT OR Apache-2.0). Its CLIP tokenizer is adapted
 from crates/segment's Apache-2.0 port, modified in 2026 for Stable Diffusion's 77-token

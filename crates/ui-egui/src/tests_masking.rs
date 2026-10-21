@@ -693,6 +693,33 @@ fn ai_model_setup_can_be_reopened_without_starting_inference_or_downloads() {
 }
 
 #[test]
+fn ungated_object_choice_keeps_semantic_masks_on_sam3_and_never_downloads_implicitly() {
+    use crate::state::Dialog;
+    use lightcraft_develop::ObjectModel;
+    if !lightcraft_engine::segment::Segmenter::AVAILABLE {
+        return;
+    }
+    let mut h = detail("panel.masking");
+    h.app.ui.settings.object_mask_model = ObjectModel::Sam1;
+    let missing = std::env::temp_dir().join(format!("lc-ui-no-sam1-{}", std::process::id()));
+    h.app.session.segmenter.sam1_model = Some(missing.join("sam_vit_b_01ec64.safetensors"));
+    h.app.session.segmenter.dir = Some(missing.join("sam3"));
+    h.step();
+    h.step();
+    assert!(h.app.widgets.iter().any(|(id, _)| id == "button:sam1Download"));
+    let r = h.request("ui.clickWidget", json!({"id":"maskNew:object"}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(develop(&h).masks.is_empty());
+    assert_eq!(h.app.ui.dialog, None, "SAM 1 must not open gated SAM 3 setup");
+    assert!(!h.app.session.segmenter.sam1_download_status().running);
+    assert!(!h.app.session.segmenter.download_status().running);
+    let r = h.request("ui.clickWidget", json!({"id":"maskNew:prompt"}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(h.app.ui.dialog, Some(Dialog::SamModel { then: Some(("prompt".into(), "new".into())), error: None }));
+    assert!(!h.app.session.segmenter.sam1_download_status().running);
+}
+
+#[test]
 fn choose_local_sam_model_folder_updates_engine_and_persisted_setting() {
     use lightcraft_engine::segment::Segmenter;
     if !Segmenter::AVAILABLE {
@@ -740,6 +767,85 @@ fn ai_preset_buttons_require_a_model_and_keep_the_requested_kind() {
         } else {
             assert_eq!(h.app.ui.dialog, None);
         }
+    }
+}
+
+#[test]
+fn ai_subject_and_background_prompt_for_a_concrete_description() {
+    use crate::state::Dialog;
+    if !lightcraft_engine::segment::Segmenter::AVAILABLE {
+        return;
+    }
+    let mut h = detail("panel.masking");
+    let dir = std::env::temp_dir().join(format!("lc-ui-ai-subject-prompt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for file in ["model.safetensors", "vocab.json", "merges.txt"] {
+        std::fs::write(dir.join(file), b"test fixture").unwrap();
+    }
+    h.app.session.segmenter.dir = Some(dir.clone());
+    for (kind, title) in [("aiSubject", "AI Subject"), ("aiBackground", "AI Background")] {
+        h.step();
+        let r = h.request("ui.clickWidget", json!({"id":format!("button:maskNew:{kind}")}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        let Some(Dialog::TextPrompt { title: actual, command, params, key, value, .. }) = h.app.ui.dialog.take() else {
+            panic!("{kind} must open a description prompt");
+        };
+        assert_eq!(actual, title);
+        assert_eq!(command, "mask.add");
+        assert_eq!(params["kind"], kind);
+        assert_eq!(key, "text");
+        assert!(value.is_empty());
+        assert!(develop(&h).masks.is_empty());
+        let dialog = Dialog::TextPrompt { title: actual, hint: String::new(), value, command, params, key };
+        let error = crate::panels::dialogs::confirm_dialog(&mut h.app, &dialog).unwrap_err();
+        assert!(error.contains("Describe the person or object"), "{error}");
+        assert!(develop(&h).masks.is_empty());
+
+        h.app.session.execute("mask.add", &json!({"kind":"radial"})).unwrap();
+        crate::panels::masking::begin_ai(&mut h.app, kind, "subtract").unwrap();
+        let Some(Dialog::TextPrompt { command, params, key, .. }) = h.app.ui.dialog.take() else {
+            panic!("{kind} component must open a description prompt");
+        };
+        assert_eq!(command, "mask.addComponent");
+        assert_eq!(params["kind"], kind);
+        assert_eq!(params["op"], "subtract");
+        assert_eq!(key, "text");
+        h.app.session.execute("edit.undo", &json!({})).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn installed_sam_dialog_continues_to_subject_description() {
+    use crate::state::Dialog;
+    if !lightcraft_engine::segment::Segmenter::AVAILABLE {
+        return;
+    }
+    for kind in ["aiSubject", "aiBackground"] {
+        let mut h = detail("panel.masking");
+        let dir = std::env::temp_dir().join(format!("lc-ui-sam-continue-{kind}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        h.app.session.segmenter.dir = Some(dir.clone());
+        h.step();
+        let r = h.request("ui.clickWidget", json!({"id":format!("button:maskNew:{kind}")}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(matches!(h.app.ui.dialog, Some(Dialog::SamModel { .. })));
+        for file in ["model.safetensors", "vocab.json", "merges.txt"] {
+            std::fs::write(dir.join(file), b"test fixture").unwrap();
+        }
+        assert!(h.app.session.segmenter.installed());
+        h.settle(SETTLE);
+        assert!(h.app.widgets.iter().any(|(id, _)| id == "button:dialogOk"));
+        let r = h.request("ui.clickWidget", json!({"id":"button:dialogOk"}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(
+            matches!(&h.app.ui.dialog, Some(Dialog::TextPrompt { command, params, key, .. })
+            if command == "mask.add" && params["kind"] == kind && key == "text"),
+            "{kind}: {:?}",
+            h.app.ui.dialog
+        );
+        assert!(develop(&h).masks.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

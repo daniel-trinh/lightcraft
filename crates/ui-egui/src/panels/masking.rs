@@ -2,7 +2,7 @@
 
 use egui::{Align2, Rect, Sense, Stroke, pos2, vec2};
 use lightcraft_catalog::PhotoId;
-use lightcraft_develop::{ControlSpec, LocalAdjustments, MaskShape, Section, Track};
+use lightcraft_develop::{ControlSpec, LocalAdjustments, MaskShape, ObjectModel, Section, Track};
 use serde_json::json;
 
 use super::edit::apply_slider_out;
@@ -87,7 +87,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             }
         });
         ui.label(
-            egui::RichText::new("AI uses the local SAM 3 model. Subject/background can be refined with Describe or Object.")
+            egui::RichText::new("AI Sky and People select directly. AI Subject and Background ask what to find. Object can also use SAM 1 below.")
                 .small()
                 .color(t.text_dim),
         );
@@ -95,6 +95,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         {
             app.offer_sam_download(None);
         }
+        object_model_setup(app, ui);
         ui.add_space(6.0);
         let tiles: [(&str, &str, Icon); 10] = [
             ("object", "Object", Icon::Subject),
@@ -660,10 +661,72 @@ fn component_row_menu(app: &mut LightcraftApp, ui: &mut egui::Ui, mask: u32, k: 
     }
 }
 
-/// Whether the SAM 3 model is missing in a build that could use it: then the download is
+/// Choose the backend for future Object masks; existing masks keep their saved backend.
+fn object_model_setup(app: &mut LightcraftApp, ui: &mut egui::Ui) {
+    if !lightcraft_engine::segment::Segmenter::AVAILABLE {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.label("Object selection model");
+    let choice = app.ui.settings.object_mask_model;
+    let r = egui::ComboBox::from_id_salt("objectMaskModel")
+        .selected_text(match choice {
+            ObjectModel::Sam1 => "SAM 1 · clicks",
+            ObjectModel::Sam3 => "SAM 3 · clicks",
+        })
+        .show_ui(ui, |ui| {
+            let r = ui.selectable_value(&mut app.ui.settings.object_mask_model, ObjectModel::Sam1, "SAM 1 · clicks (ungated)");
+            register(ui.ctx(), "objectModel:sam1", r.rect);
+            let r = ui.selectable_value(&mut app.ui.settings.object_mask_model, ObjectModel::Sam3, "SAM 3 · clicks");
+            register(ui.ctx(), "objectModel:sam3", r.rect);
+        });
+    register(ui.ctx(), "objectModel", r.response.rect);
+    if app.ui.settings.object_mask_model != ObjectModel::Sam1 {
+        return;
+    }
+    ui.label(egui::RichText::new("SAM 1 selects objects with clicks. Describe and the AI presets use SAM 3.").small());
+    let license = ui.link("Apache-2.0 licence · 375 MB");
+    register(ui.ctx(), "link:sam1License", license.rect);
+    if license.clicked() {
+        let _ = crate::links::open(app, lightcraft_engine::segment::sam1_model::LICENSE_URL);
+    }
+    let installed = app.session.segmenter.sam1_installed();
+    let status = app.session.segmenter.sam1_download_status();
+    if status.running {
+        let fraction = if status.total > 0 { status.done as f64 / status.total as f64 } else { 0.0 };
+        let r = ui.add(egui::ProgressBar::new(fraction as f32).text(format!("{:.1} / 375 MB", status.done as f64 / 1e6)));
+        register(ui.ctx(), "progress:sam1Download", r.rect);
+        if text_button(ui, "sam1Cancel", "Cancel Download", false).clicked()
+            && let Err(e) = app.run("segment.sam1.cancel", json!({}))
+        {
+            app.toast_error(ui.ctx(), e);
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    } else if installed {
+        ui.label(if status.finished { "Object model verified · runs locally" } else { "Object model present locally" });
+        if text_button(ui, "sam1Repair", "Verify / repair model", false).clicked()
+            && let Err(e) = app.run("segment.sam1.download", json!({"acknowledged": true}))
+        {
+            app.toast_error(ui.ctx(), e);
+        }
+        ui.label(egui::RichText::new("Checks the checksum; downloads 375 MB again if damaged.").small());
+    } else if text_button(ui, "sam1Download", "Download Object model (375 MB)", false).clicked()
+        && let Err(e) = app.run("segment.sam1.download", json!({"acknowledged": true}))
+    {
+        app.toast_error(ui.ctx(), e);
+    }
+    if let Some(error) = status.error {
+        ui.label(egui::RichText::new(error).color(egui::Color32::from_rgb(230, 90, 80)));
+    }
+}
+
+/// Whether the selected model is missing in a build that could use it. SAM 3 setup is
 /// offered (with `then` to start afterwards) instead of starting an AI mask.
 fn needs_model(app: &mut LightcraftApp, kind: &str, op: &str) -> bool {
     let seg = &app.session.segmenter;
+    if kind == "object" && app.ui.settings.object_mask_model == ObjectModel::Sam1 {
+        return lightcraft_engine::segment::Segmenter::AVAILABLE && !seg.sam1_installed();
+    }
     let missing = lightcraft_engine::segment::Segmenter::AVAILABLE && seg.dir.is_some() && !seg.installed();
     if missing {
         app.offer_sam_download(Some((kind, op)));
@@ -671,14 +734,21 @@ fn needs_model(app: &mut LightcraftApp, kind: &str, op: &str) -> bool {
     missing
 }
 
-/// Start an Object selection (SAM 3 clicks): a new mask, or a component of the selected one
+/// Start an Object selection: a new mask, or a component of the selected one
 /// combined by `op`; the photo is analyzed meanwhile (in the background).
 pub(crate) fn start_object(app: &mut LightcraftApp, ctx: &egui::Context, op: &str) {
     if needs_model(app, "object", op) {
+        if app.ui.settings.object_mask_model == ObjectModel::Sam1 {
+            app.toast_error(ctx, "Download the Object model using the button above Object selection (375 MB).");
+        }
         return;
     }
-    let r =
-        if op == "new" { app.run("mask.add", json!({"kind": "object"})) } else { app.run("mask.addComponent", json!({"op": op, "kind": "object"})) };
+    let model = app.ui.settings.object_mask_model;
+    let r = if op == "new" {
+        app.run("mask.add", json!({"kind": "object", "model": model}))
+    } else {
+        app.run("mask.addComponent", json!({"op": op, "kind": "object", "model": model}))
+    };
     match r {
         Ok(_) => {
             app.ui.tool = "object".into();
@@ -688,28 +758,35 @@ pub(crate) fn start_object(app: &mut LightcraftApp, ctx: &egui::Context, op: &st
     }
 }
 
-/// Start an AI mask of `kind` (object|prompt) combined by `op` (new|add|subtract|intersect),
+/// Start an AI mask of `kind` combined by `op` (new|add|subtract|intersect),
 /// after the model was installed.
 pub(crate) fn begin_ai(app: &mut LightcraftApp, kind: &str, op: &str) -> Result<serde_json::Value, String> {
     match kind {
-        "aiSky" | "aiSubject" | "aiBackground" | "aiPeople" => {
-            let name = match kind {
-                "aiSky" => "AI Sky",
-                "aiSubject" => "AI Subject",
-                "aiBackground" => "AI Background",
-                _ => "AI People",
+        "aiSubject" | "aiBackground" => {
+            let (title, hint) = if kind == "aiSubject" {
+                ("AI Subject", "Describe the person or object, e.g. astronaut")
+            } else {
+                ("AI Background", "Describe the foreground to exclude, e.g. astronaut")
             };
+            let (command, params) =
+                if op == "new" { ("mask.add", json!({"kind":kind,"name":title})) } else { ("mask.addComponent", json!({"kind":kind,"op":op})) };
+            super::dialogs::prompt(app, title, hint, "", command, params, "text");
+            Ok(serde_json::Value::Null)
+        }
+        "aiSky" | "aiPeople" => {
             if op == "new" {
+                let name = if kind == "aiSky" { "AI Sky" } else { "AI People" };
                 app.run("mask.add", json!({"kind": kind, "name": name}))
             } else {
                 app.run("mask.addComponent", json!({"op": op, "kind": kind}))
             }
         }
         "object" => {
+            let model = app.ui.settings.object_mask_model;
             let r = if op == "new" {
-                app.run("mask.add", json!({"kind": "object"}))
+                app.run("mask.add", json!({"kind": "object", "model": model}))
             } else {
-                app.run("mask.addComponent", json!({"op": op, "kind": "object"}))
+                app.run("mask.addComponent", json!({"op": op, "kind": "object", "model": model}))
             }?;
             app.ui.tool = "object".into();
             Ok(r)

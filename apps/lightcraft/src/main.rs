@@ -513,6 +513,7 @@ fn main() -> eframe::Result {
             // the user's own download locations, one base URL per line (LIGHTCRAFT_SAM3_MIRRORS too)
             session.segmenter.mirrors_file = config_dir().map(|d| d.join("models").join("sam3-mirrors.txt"));
             let mut app = LightcraftApp::new(session, services());
+            let first_launch = prefs.is_none();
             if let Some(ui) = prefs {
                 app.ui = ui;
             }
@@ -523,6 +524,10 @@ fn main() -> eframe::Result {
                     (!saved.is_empty()).then(|| std::path::PathBuf::from(saved))
                 })
                 .or_else(|| config_dir().map(|d| d.join("models").join("sam3")));
+            app.session.segmenter.sam1_model = lightcraft_engine::segment::sam1_model::default_model_path(&app.ui.settings.sam1_model_file);
+            if first_launch && app.session.segmenter.sam1_installed() {
+                app.ui.settings.object_mask_model = lightcraft_engine::develop::ObjectModel::Sam1;
+            }
             lightcraft_ui_egui::i18n::set_language(app.ui.language);
             app.integrated_titlebar = cfg!(target_os = "macos");
             app.notices.extend(prefs_warning);

@@ -1,4 +1,4 @@
-//! The SAM 3 worker thread: it owns the model and the last encoded photo, and runs every
+//! The AI mask worker thread: it owns one SAM model and the last encoded photo, and runs every
 //! request (load, render the model input, encode, clicks, descriptions, detail passes) in
 //! turn. The session only sends jobs and receives outcomes over channels, so no thread ever
 //! waits on a lock the model holds, and the UI thread never runs the model.
@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-use lightcraft_develop::SegMask;
+use lightcraft_develop::{ObjectModel, SegMask};
+use lightcraft_segment::sam1::{self, Sam1};
 use lightcraft_segment::{Encoded, Sam3};
 
 use super::{Input, Prompt, Tag};
@@ -24,6 +25,7 @@ use crate::media::RenderJob;
 
 /// Unload the model after this long without a request.
 pub const IDLE_UNLOAD: Duration = Duration::from_secs(10 * 60);
+static NO_CANCEL: AtomicBool = AtomicBool::new(false);
 
 /// What to compute.
 pub enum Kind {
@@ -43,9 +45,10 @@ pub enum Kind {
 
 /// One request.
 pub struct Job {
-    /// The model folder.
+    /// SAM 3's model folder or SAM 1's checkpoint file.
     pub dir: PathBuf,
-    /// Which photo and look the request is about (the encode cache's key).
+    pub model: ObjectModel,
+    /// Which photo and look the request is about (the encode cache's key and stale-result guard).
     pub key: u64,
     /// Renders the model input when the cache doesn't hold `key` (always for a detail pass).
     pub render: Option<RenderJob>,
@@ -59,6 +62,8 @@ pub struct Job {
 /// A finished request: the segmentation (`None`: nothing selected / nothing to report).
 pub struct Outcome {
     pub tag: Tag,
+    /// Photo/content/develop key captured before rendering the model input.
+    pub key: u64,
     pub result: Result<Option<SegMask>, String>,
     /// A newer request for the same selection came in; this one was skipped.
     pub superseded: bool,
@@ -156,7 +161,7 @@ impl Worker {
         // (re)start the thread
         let (tx, rx) = mpsc::channel();
         let shared = self.shared.clone();
-        match std::thread::Builder::new().name("sam3".into()).spawn(move || run(&rx, &shared, IDLE_UNLOAD)) {
+        match std::thread::Builder::new().name("ai-mask".into()).spawn(move || run(&rx, &shared, IDLE_UNLOAD)) {
             Ok(t) => {
                 self.thread = Some(t);
                 self.tx = Some(tx.clone());
@@ -173,16 +178,30 @@ impl Worker {
 /// The model and the last encoded photo.
 #[derive(Default)]
 struct State {
-    model: Option<(PathBuf, Sam3)>,
-    cache: Option<(u64, Encoded)>,
+    model: Option<(ObjectModel, PathBuf, Model)>,
+    cache: Option<(u64, Encoding)>,
+}
+
+enum Model {
+    Sam3(Box<Sam3>),
+    Sam1(Box<Sam1>),
+}
+
+enum Encoding {
+    Sam3(Encoded),
+    Sam1(sam1::Encoded),
 }
 
 /// Whether `later` makes `job` pointless (it asks for the same selection again).
 fn supersedes(later: &Job, job: &Job) -> bool {
     match (&later.tag, &job.tag) {
-        (Tag::Prepare, Tag::Prepare) => later.key == job.key,
-        (Tag::Clicks { photo: a, mask: am, comp: ac, .. }, Tag::Clicks { photo: b, mask: bm, comp: bc, .. }) => (a, am, ac) == (b, bm, bc),
-        (Tag::Detail { photo: a, mask: am, comp: ac, .. }, Tag::Detail { photo: b, mask: bm, comp: bc, .. }) => (a, am, ac) == (b, bm, bc),
+        (Tag::Prepare, Tag::Prepare) => later.key == job.key && later.model == job.model,
+        (Tag::Clicks { photo: a, mask: am, comp: ac, model: ax, .. }, Tag::Clicks { photo: b, mask: bm, comp: bc, model: bx, .. }) => {
+            (a, am, ac, ax) == (b, bm, bc, bx)
+        }
+        (Tag::Detail { photo: a, mask: am, comp: ac, .. }, Tag::Detail { photo: b, mask: bm, comp: bc, .. }) => {
+            (a, am, ac, later.model) == (b, bm, bc, job.model)
+        }
         _ => false,
     }
 }
@@ -198,7 +217,7 @@ fn run(rx: &mpsc::Receiver<Job>, shared: &Shared, idle: Duration) {
                     if state.model.is_some() {
                         state = State::default();
                         shared.loaded.store(false, Ordering::SeqCst);
-                        log::info!("SAM 3 unloaded after {} minutes without use", idle.as_secs() / 60);
+                        log::info!("AI mask model unloaded after {} minutes without use", idle.as_secs() / 60);
                     }
                     continue;
                 }
@@ -212,14 +231,14 @@ fn run(rx: &mpsc::Receiver<Job>, shared: &Shared, idle: Duration) {
         let is_detail = matches!(job.kind, Kind::Detail { .. });
         let _done = Done(if is_detail { &shared.detail } else { &shared.pending });
         if queue.iter().any(|later| supersedes(later, &job)) {
-            let _ = job.reply.send(Outcome { tag: job.tag, result: Ok(None), superseded: true });
+            let _ = job.reply.send(Outcome { tag: job.tag, key: job.key, result: Ok(None), superseded: true });
             continue;
         }
         let result = match std::panic::catch_unwind(AssertUnwindSafe(|| run_job(&mut state, shared, &mut job))) {
             Ok(r) => r,
             Err(p) => {
                 let why = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
-                log::error!("SAM 3 panicked: {why}");
+                log::error!("AI mask model panicked: {why}");
                 // don't trust what the model kept: load it again next time
                 state = State::default();
                 Err("the AI model failed unexpectedly (it will be reloaded on the next try)".to_string())
@@ -229,23 +248,39 @@ fn run(rx: &mpsc::Receiver<Job>, shared: &Shared, idle: Duration) {
             state.cache = None;
         }
         shared.loaded.store(state.model.is_some(), Ordering::SeqCst);
-        let _ = job.reply.send(Outcome { tag: job.tag, result, superseded: false });
+        let _ = job.reply.send(Outcome { tag: job.tag, key: job.key, result, superseded: false });
     }
 }
 
 /// The model for `dir`, loading it when needed.
-fn model<'a>(state: &'a mut State, shared: &Shared, dir: &std::path::Path) -> Result<&'a mut Sam3, String> {
-    if state.model.as_ref().is_none_or(|(d, _)| d != dir) {
+fn model<'a>(state: &'a mut State, shared: &Shared, backend: ObjectModel, dir: &std::path::Path) -> Result<&'a mut Model, String> {
+    if state.model.as_ref().is_none_or(|(b, d, _)| *b != backend || d != dir) {
         state.model = None;
         state.cache = None;
         let _busy = Flag::raise(&shared.encoding);
         let t = web_time::Instant::now();
-        let m = Sam3::load(dir).map_err(|e| e.to_string())?;
-        log::info!("SAM 3 loaded in {:?}", t.elapsed());
-        state.model = Some((dir.to_path_buf(), m));
+        let m = match backend {
+            ObjectModel::Sam3 => Model::Sam3(Box::new(Sam3::load(dir).map_err(|e| e.to_string())?)),
+            ObjectModel::Sam1 => {
+                Model::Sam1(Box::new(Sam1::load(dir, lightcraft_segment::best_device().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?))
+            }
+        };
+        let device = match &m {
+            Model::Sam3(m) => m.device(),
+            Model::Sam1(m) => m.device(),
+        };
+        let compute = if device.is_cuda() {
+            "NVIDIA CUDA"
+        } else if device.is_metal() {
+            "Metal"
+        } else {
+            "CPU"
+        };
+        log::info!("{backend:?} loaded on {compute} in {:?}", t.elapsed());
+        state.model = Some((backend, dir.to_path_buf(), m));
         shared.loaded.store(true, Ordering::SeqCst);
     }
-    state.model.as_mut().map(|(_, m)| m).ok_or_else(|| "the model did not load".to_string())
+    state.model.as_mut().map(|(_, _, m)| m).ok_or_else(|| "the model did not load".to_string())
 }
 
 /// Render the model input.
@@ -267,22 +302,28 @@ fn render(job: &mut Job) -> Result<Input, String> {
 }
 
 /// The model and the encoded photo `job.key` (rendering and encoding it when needed).
-fn encoded<'a>(state: &'a mut State, shared: &Shared, job: &mut Job) -> Result<(&'a mut Sam3, &'a mut Encoded), String> {
-    model(state, shared, &job.dir)?;
+fn encoded<'a>(state: &'a mut State, shared: &Shared, job: &mut Job) -> Result<(&'a mut Model, &'a mut Encoding), String> {
+    model(state, shared, job.model, &job.dir)?;
     if state.cache.as_ref().is_none_or(|(k, _)| *k != job.key) {
         state.cache = None;
         let input = render(job)?;
         let _busy = Flag::raise(&shared.encoding);
-        let m = state.model.as_mut().map(|(_, m)| m).ok_or("the model did not load")?;
+        let m = state.model.as_mut().map(|(_, _, m)| m).ok_or("the model did not load")?;
         let t = web_time::Instant::now();
-        let mut enc = m.encode(&input.rgb, input.w, input.h).map_err(|e| e.to_string())?;
-        m.prepare_clicks(&mut enc).map_err(|e| e.to_string())?;
-        log::info!("SAM 3 encoded {}×{} in {:?}", input.w, input.h, t.elapsed());
+        let enc = match m {
+            Model::Sam3(m) => {
+                let mut enc = m.encode(&input.rgb, input.w, input.h).map_err(|e| e.to_string())?;
+                m.prepare_clicks(&mut enc).map_err(|e| e.to_string())?;
+                Encoding::Sam3(enc)
+            }
+            Model::Sam1(m) => Encoding::Sam1(m.encode(&input.rgb, input.w, input.h, &NO_CANCEL).map_err(|e| e.to_string())?),
+        };
+        log::info!("{:?} encoded {}×{} in {:?}", job.model, input.w, input.h, t.elapsed());
         state.cache = Some((job.key, enc));
     }
     let State { model, cache } = state;
     match (model.as_mut(), cache.as_mut()) {
-        (Some((_, m)), Some((_, e))) => Ok((m, e)),
+        (Some((_, _, m)), Some((_, e))) => Ok((m, e)),
         _ => Err("the model is not ready".into()),
     }
 }
@@ -302,8 +343,18 @@ fn text_logits(model: &mut Sam3, enc: &mut Encoded, text: &str) -> Result<Option
     Ok(merged)
 }
 
+fn click_logits(model: &mut Model, enc: &mut Encoding, clicks: &[lightcraft_segment::Click]) -> Result<(usize, Vec<f32>), String> {
+    match (model, enc) {
+        (Model::Sam3(m), Encoding::Sam3(e)) => Ok((lightcraft_segment::MASK_SIDE, m.segment_clicks(e, clicks).map_err(|e| e.to_string())?.logits)),
+        (Model::Sam1(m), Encoding::Sam1(e)) => {
+            let clicks: Vec<_> = clicks.iter().map(|c| sam1::Click { x: f64::from(c.x), y: f64::from(c.y), positive: c.positive }).collect();
+            Ok((sam1::MASK_SIDE, m.segment_clicks(e, &clicks, &NO_CANCEL).map_err(|e| e.to_string())?.logits))
+        }
+        _ => Err("AI mask model and encoded image do not match".into()),
+    }
+}
+
 fn run_job(state: &mut State, shared: &Shared, job: &mut Job) -> Result<Option<SegMask>, String> {
-    let side = lightcraft_segment::MASK_SIDE;
     match std::mem::replace(&mut job.kind, Kind::Prepare) {
         Kind::Prepare => {
             encoded(state, shared, job)?;
@@ -311,21 +362,28 @@ fn run_job(state: &mut State, shared: &Shared, job: &mut Job) -> Result<Option<S
         }
         Kind::Clicks(clicks) => {
             let (m, enc) = encoded(state, shared, job)?;
-            let p = m.segment_clicks(enc, &clicks).map_err(|e| e.to_string())?;
-            Ok(Some(SegMask::from_logits(side, &p.logits)))
+            let (side, logits) = click_logits(m, enc, &clicks)?;
+            Ok(Some(SegMask::from_logits(side, &logits)))
         }
         Kind::Text(text) => {
+            if job.model != ObjectModel::Sam3 {
+                return Err("text masks require SAM 3".into());
+            }
             let (m, enc) = encoded(state, shared, job)?;
-            Ok(text_logits(m, enc, &text)?.map(|l| SegMask::from_logits(side, &l)))
+            let (Model::Sam3(m), Encoding::Sam3(enc)) = (m, enc) else { return Err("text masks require SAM 3".into()) };
+            Ok(text_logits(m, enc, &text)?.map(|l| SegMask::from_logits(lightcraft_segment::MASK_SIDE, &l)))
         }
         #[cfg(test)]
         #[allow(clippy::panic)]
         Kind::Panic => panic!("a test panic"),
         Kind::Detail { prompt, region } => {
             let input = render(job)?;
-            let m = model(state, shared, &job.dir)?;
+            let m = model(state, shared, job.model, &job.dir)?;
             let t = web_time::Instant::now();
-            let mut enc = m.encode(&input.rgb, input.w, input.h).map_err(|e| e.to_string())?;
+            let mut enc = match m {
+                Model::Sam3(m) => Encoding::Sam3(m.encode(&input.rgb, input.w, input.h).map_err(|e| e.to_string())?),
+                Model::Sam1(m) => Encoding::Sam1(m.encode(&input.rgb, input.w, input.h, &NO_CANCEL).map_err(|e| e.to_string())?),
+            };
             let (rw, rh) = (region[2] - region[0], region[3] - region[1]);
             if !(rw > 0.0 && rh > 0.0) {
                 return Ok(None);
@@ -341,12 +399,15 @@ fn run_job(state: &mut State, shared: &Shared, job: &mut Job) -> Result<Option<S
                     if !inside.iter().any(|c| c.positive) {
                         return Ok(None);
                     }
-                    Some(m.segment_clicks(&mut enc, &inside).map_err(|e| e.to_string())?.logits)
+                    Some(click_logits(m, &mut enc, &inside)?)
                 }
-                Prompt::Text(text) => text_logits(m, &mut enc, &text)?,
+                Prompt::Text(text) => {
+                    let (Model::Sam3(m), Encoding::Sam3(enc)) = (m, &mut enc) else { return Err("text masks require SAM 3".into()) };
+                    text_logits(m, enc, &text)?.map(|l| (lightcraft_segment::MASK_SIDE, l))
+                }
             };
-            log::info!("SAM 3 detail pass ({}×{}) in {:?}", input.w, input.h, t.elapsed());
-            Ok(logits.map(|l| SegMask::from_logits_in(side, &l, region)))
+            log::info!("{:?} detail pass ({}×{}) in {:?}", job.model, input.w, input.h, t.elapsed());
+            Ok(logits.map(|(side, l)| SegMask::from_logits_in(side, &l, region)))
         }
     }
 }
@@ -358,7 +419,7 @@ mod tests {
     fn job(tag: Tag, reply: &mpsc::Sender<Outcome>) -> Job {
         // an empty folder: loading fails with an error (no model files)
         let dir = std::env::temp_dir().join(format!("lc-sam3-worker-none-{}", std::process::id()));
-        Job { dir, key: 1, render: None, missing: None, kind: Kind::Prepare, tag, reply: reply.clone() }
+        Job { dir, model: ObjectModel::Sam3, key: 1, render: None, missing: None, kind: Kind::Prepare, tag, reply: reply.clone() }
     }
 
     #[test]
@@ -408,6 +469,7 @@ mod tests {
             photo: lightcraft_catalog::PhotoId(1),
             mask: 1,
             comp: 0,
+            model: ObjectModel::Sam3,
             hint: vec![lightcraft_geom::Point::new(0.5, 0.5); n],
             exclude: vec![],
         };

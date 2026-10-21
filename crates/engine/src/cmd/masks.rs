@@ -1,6 +1,6 @@
 //! Masking and Remove (spot) commands on the active photo.
 
-use lightcraft_develop::{BrushStroke, LocalAdjustments, Mask, MaskComponent, MaskOp, MaskShape, RedEye, Spot, SpotMode};
+use lightcraft_develop::{BrushStroke, LocalAdjustments, Mask, MaskComponent, MaskOp, MaskShape, ObjectModel, RedEye, Spot, SpotMode};
 use lightcraft_geom::Point;
 use serde_json::{Value, json};
 
@@ -9,6 +9,9 @@ use crate::segment::{Click, MAX_CLICKS};
 use crate::{Result, Session};
 
 fn shape_from(kind: &str, p: &Value, c: &str) -> Result<MaskShape> {
+    if kind != "object" && p.get("model").is_some() {
+        return Err(bad(c, "model applies only to Object masks; Describe and AI presets use SAM 3"));
+    }
     Ok(match kind {
         "brush" => MaskShape::Brush { strokes: vec![] },
         "linear" => {
@@ -39,12 +42,24 @@ fn shape_from(kind: &str, p: &Value, c: &str) -> Result<MaskShape> {
                 .unwrap_or_default();
             MaskShape::ColorRange { samples, refine: f64_or(p, "refine", 50.0) }
         }
-        "object" => MaskShape::Object { hint: points(p, "points"), exclude: points(p, "exclude"), seg: seg_param(p), detail: vec![], edge: 0.0 },
+        "object" => MaskShape::Object {
+            model: match p.get("model") {
+                None => ObjectModel::Sam3,
+                Some(v) => serde_json::from_value(v.clone()).map_err(|_| bad(c, "Object model must be sam1 or sam3"))?,
+            },
+            hint: points(p, "points"),
+            exclude: points(p, "exclude"),
+            seg: seg_param(p),
+            detail: vec![],
+            edge: 0.0,
+        },
         "prompt" | "aiSky" | "aiSubject" | "aiBackground" | "aiPeople" => {
+            if matches!(kind, "aiSubject" | "aiBackground") && p.get("text").and_then(Value::as_str).is_none_or(|text| text.trim().is_empty()) {
+                return Err(bad(c, "Describe the person or object to select with AI Subject or AI Background (text is required)"));
+            }
             let default = match kind {
                 "aiSky" => "sky",
                 "aiPeople" => "person",
-                "aiSubject" | "aiBackground" => "main subject",
                 _ => "",
             };
             let text = str_param(p, "text").unwrap_or(default).trim().to_string();
@@ -89,7 +104,7 @@ fn seg_param(p: &Value) -> Option<lightcraft_develop::SegMask> {
 enum Later {
     Nothing,
     /// Background mode: these Object clicks are segmented on the worker.
-    Clicks(Vec<Point>, Vec<Point>),
+    Clicks(ObjectModel, Vec<Point>, Vec<Point>),
     /// Background mode: the Describe selection is computed first; the mask is added when found.
     Text(String),
 }
@@ -101,21 +116,26 @@ enum Later {
 fn resolve_ai(s: &mut Session, shape: &mut MaskShape, c: &str) -> Result<Later> {
     let id = s.active().ok_or_else(|| bad(c, "no active photo"))?;
     let background = s.segmenter.background;
+    if let MaskShape::Object { hint, exclude, seg: None, .. } = &*shape
+        && hint.len().saturating_add(exclude.len()) > MAX_CLICKS
+    {
+        return Err(ai_err(format!("an Object selection takes at most {MAX_CLICKS} clicks")));
+    }
     match shape {
         MaskShape::Object { seg: Some(_), .. } | MaskShape::Prompt { seg: Some(_), .. } => {}
-        MaskShape::Object { hint, exclude, .. } if !hint.is_empty() && background => {
-            s.segmenter.model_dir().map_err(ai_err)?;
-            return Ok(Later::Clicks(std::mem::take(hint), std::mem::take(exclude)));
+        MaskShape::Object { model, hint, exclude, .. } if !hint.is_empty() && background => {
+            s.segmenter.object_model_file(*model).map_err(ai_err)?;
+            return Ok(Later::Clicks(*model, std::mem::take(hint), std::mem::take(exclude)));
         }
-        MaskShape::Object { hint, exclude, seg, .. } if !hint.is_empty() => {
-            *seg = Some(s.segment_clicks(id, &clicks_of(hint, exclude)).map_err(ai_err)?);
+        MaskShape::Object { model, hint, exclude, seg, .. } if !hint.is_empty() => {
+            *seg = Some(s.segment_clicks_with_model(id, *model, &clicks_of(hint, exclude)).map_err(ai_err)?);
         }
-        MaskShape::Object { .. } => {
+        MaskShape::Object { model, .. } => {
             // the clicks come later: refuse an Object mask that could never be computed (no
             // model) rather than leave an empty one; in the app, analyze the photo meanwhile
-            s.segmenter.model_dir().map_err(ai_err)?;
+            s.segmenter.object_model_file(*model).map_err(ai_err)?;
             if background {
-                s.segment_prepare(id).map_err(ai_err)?;
+                s.segment_prepare_with_model(id, *model).map_err(ai_err)?;
             }
         }
         MaskShape::Prompt { text, .. } if background => {
@@ -136,9 +156,9 @@ fn resolve_ai(s: &mut Session, shape: &mut MaskShape, c: &str) -> Result<Later> 
 
 /// Queue what a new AI component (component `comp` of mask `mask`) still needs.
 fn queue_later(s: &mut Session, later: Later, mask: u32, comp: usize, mut out: Value) -> Result<Value> {
-    if let Later::Clicks(hint, exclude) = later {
+    if let Later::Clicks(model, hint, exclude) = later {
         let id = s.active().ok_or_else(|| ai_err("no active photo"))?;
-        s.segment_clicks_later(id, mask, comp, hint, exclude).map_err(ai_err)?;
+        s.segment_clicks_later(id, mask, comp, model, hint, exclude).map_err(ai_err)?;
         out["pending"] = json!(true);
     }
     Ok(out)
@@ -178,7 +198,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create New Mask",
             [],
             None,
-            "{kind: brush|linear|radial|sky|subject|background|luminanceRange|colorRange|object|prompt|aiSky|aiSubject|aiBackground|aiPeople, ...shape params, text?, seg?, invert?, name?} — AI presets use SAM 3 (sky/person/main subject or supplied text); aiBackground inverts the described subject. Stored seg needs no model. In the app AI returns {pending} and the mask appears when found",
+            "{kind: brush|linear|radial|sky|subject|background|luminanceRange|colorRange|object|prompt|aiSky|aiSubject|aiBackground|aiPeople, model?: sam1|sam3 (Object only; default sam3), ...shape params, text?, seg?, invert?, name?} — AI presets use SAM 3; aiSubject and aiBackground require explicit nonempty text naming a person or object, and aiBackground inverts it. Sky/People default to sky/person. Stored seg needs no model. In the app AI returns {pending} and the mask appears when found",
             has_active,
             |s, p| {
                 let kind = str_param(p, "kind").unwrap_or("radial").to_string();
@@ -210,7 +230,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add/Subtract/Intersect Mask",
             [],
             None,
-            "{id?: maskId, op: add|subtract|intersect, kind, ...shape params}",
+            "{id?: maskId, op: add|subtract|intersect, kind, model?: sam1|sam3 (Object only; default sam3), text?: string (required for aiSubject/aiBackground), ...shape params}",
             has_active,
             |s, p| {
                 let kind = str_param(p, "kind").unwrap_or("brush").to_string();
@@ -351,7 +371,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Object Click",
             [],
             None,
-            "{x, y: normalized image point, exclude?: bool (⌥-click: leave this part out), id?: maskId} — a click on the selected mask's Object selection (its last Object component); SAM 3 re-segments the object → {include, exclude}",
+            "{x, y: normalized image point, exclude?: bool (⌥-click: leave this part out), id?: maskId} — a click on the selected mask's Object selection (its last Object component); its recorded SAM 1 or SAM 3 model re-segments the object → {include, exclude}",
             has_active,
             |s, p| {
                 let c = "mask.objectPoint";
@@ -369,12 +389,12 @@ pub fn specs() -> Vec<CommandSpec> {
                     .iter()
                     .rposition(|x| matches!(x.shape, MaskShape::Object { .. }))
                     .ok_or_else(|| bad(c, "the mask has no Object selection (add one first)"))?;
-                let Some(MaskShape::Object { hint, exclude: ex, edge, .. }) = m.components.get(k).map(|x| &x.shape) else {
+                let Some(MaskShape::Object { model, hint, exclude: ex, edge, .. }) = m.components.get(k).map(|x| &x.shape) else {
                     return Err(bad(c, "not an Object component"));
                 };
-                let (mut hint, mut ex, edge) = (hint.clone(), ex.clone(), *edge);
+                let (model, mut hint, mut ex, edge) = (*model, hint.clone(), ex.clone(), *edge);
                 // clicks still on their way to the model count too
-                if let Some(pending) = s.segmenter.pending_clicks().filter(|q| (q.photo, q.mask, q.comp) == (id, mid, k)) {
+                if let Some(pending) = s.segmenter.pending_clicks().filter(|q| (q.photo, q.mask, q.comp, q.model) == (id, mid, k, model)) {
                     (hint, ex) = (pending.hint.clone(), pending.exclude.clone());
                 }
                 if hint.len() + ex.len() >= MAX_CLICKS {
@@ -387,15 +407,15 @@ pub fn specs() -> Vec<CommandSpec> {
                 }
                 if s.segmenter.background && !hint.is_empty() {
                     let out = json!({"include": hint.len(), "exclude": ex.len(), "pending": true});
-                    s.segment_clicks_later(id, mid, k, hint, ex).map_err(ai_err)?;
+                    s.segment_clicks_later(id, mid, k, model, hint, ex).map_err(ai_err)?;
                     return Ok(out);
                 }
-                let seg = if hint.is_empty() { None } else { Some(s.segment_clicks(id, &clicks_of(&hint, &ex)).map_err(ai_err)?) };
+                let seg = if hint.is_empty() { None } else { Some(s.segment_clicks_with_model(id, model, &clicks_of(&hint, &ex)).map_err(ai_err)?) };
                 let out = json!({"include": hint.len(), "exclude": ex.len()});
                 masks_edit(s, c, "Object Mask", |masks, _| {
                     let i = find(masks, mid, c)?;
                     if let Some(comp) = masks[i].components.get_mut(k) {
-                        comp.shape = MaskShape::Object { hint, exclude: ex, seg, detail: vec![], edge };
+                        comp.shape = MaskShape::Object { model, hint, exclude: ex, seg, detail: vec![], edge };
                     }
                     Ok(())
                 })?;
@@ -407,7 +427,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Refine AI Mask Detail",
             [],
             None,
-            "{id?: maskId, component?} — a zoomed-in SAM 3 pass over an Object/Describe selection (default: the mask's last one): the photo around it is analyzed again at a higher resolution, in the background; the mask updates when it's done → {started}",
+            "{id?: maskId, component?} — a zoomed-in pass over an Object/Describe selection (default: the mask's last one), using its recorded model; the photo around it is analyzed again at a higher resolution, in the background → {started}",
             has_active,
             |s, p| {
                 let c = "mask.refineDetail";
@@ -993,4 +1013,30 @@ fn clamp_local(mut a: LocalAdjustments) -> LocalAdjustments {
     c(&mut a.color_sat, 0.0, 100.0);
     c(&mut a.amount, 0.0, 200.0);
     a
+}
+
+#[cfg(test)]
+mod object_model_tests {
+    use super::*;
+
+    #[test]
+    fn object_command_model_is_explicit_and_invalid_values_fail() {
+        let a = shape_from("object", &json!({}), "mask.add").unwrap();
+        assert!(matches!(a, MaskShape::Object { model: ObjectModel::Sam3, .. }));
+        let b = shape_from("object", &json!({"model":"sam1"}), "mask.add").unwrap();
+        assert!(matches!(b, MaskShape::Object { model: ObjectModel::Sam1, .. }));
+        assert!(shape_from("object", &json!({"model":"unknown"}), "mask.add").is_err());
+        assert!(shape_from("aiSky", &json!({"model":"sam1"}), "mask.add").is_err());
+    }
+
+    #[cfg(feature = "sam")]
+    #[test]
+    fn missing_sam1_rejects_empty_object_without_changing_catalog() {
+        let mut s = Session::with_demo();
+        let id = s.active().unwrap();
+        let before = s.develop_of(id).unwrap().masks.len();
+        let e = s.execute("mask.add", &json!({"kind":"object","model":"sam1"})).unwrap_err().to_string();
+        assert!(e.contains(crate::segment::SAM1_NOT_INSTALLED), "{e}");
+        assert_eq!(s.develop_of(id).unwrap().masks.len(), before);
+    }
 }

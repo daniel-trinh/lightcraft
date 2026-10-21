@@ -6,8 +6,8 @@ projects (DrawCraft reached its first four milestones in ≈ 4½ h) and are revi
 
 ## Where we stand
 
-**AI fork update, 2026-10-20 (development branch):** optional SAM 3 presets now select sky, people, subject and
-background, with model results stored in masks. Native MI-GAN removal and app-managed SD 1.5 prompt Fill
+**AI fork update, 2026-10-20 (development branch):** optional SAM 3 selects sky, people and described subjects
+or backgrounds, with model results stored in masks. Native MI-GAN removal and app-managed SD 1.5 prompt Fill
 use a selected mask and create a new PNG/catalog photo. The portable packager now includes the
 small MIT-licensed removal model; prompt Fill offers a separate model download. This is still under validation:
 real Fill/Remove tests pass on procedural images,
@@ -17,7 +17,13 @@ has run real inference and its portable app launched with only Windows system di
 The native MI-GAN core matches the author's raw ONNX results on three CPU fixtures and a CUDA fixture.
 The portable preflight passed two normal Remove button actions without the Fill model installed,
 including source preservation, undo and reuse of the GPU context between background jobs.
-Final release validation is still in progress; actual SAM inference awaits gated model access. Native output
+The r3 portable release passed package and repeated GUI Remove validation. SAM 3 real-photo CUDA
+checks passed for clicks, person, sky and a described background; generic `main subject` failed,
+so AI Subject / Background now ask for a concrete description. SAM 1 click masking passed real
+square, portrait and landscape photo checks on the RTX 4090, including negative clicks, detail,
+rendering and undo. Its ungated setup also passed same-sized corrupt-file repair and normal
+desktop masking followed by Remove. These checks do not establish broad accuracy or numerical
+parity with the reference SAM implementations. Native output
 now retains the cropped photo resolution up to 64 MP; the model processes a context patch at up
 to 512 px. An optional CUDA build targets NVIDIA GPUs; ordinary Windows builds still use CPU.
 The upstream readiness estimates below

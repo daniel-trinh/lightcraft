@@ -137,6 +137,10 @@ pub struct AppSettings {
     pub library_path: String,
     /// Optional locally selected SAM 3 model folder; empty uses the default config folder.
     pub sam_model_dir: String,
+    /// Optional SAM 1 checkpoint path; empty uses bundled weights or app storage.
+    pub sam1_model_file: String,
+    /// Backend for newly created click-based Object masks. Semantic presets use SAM 3.
+    pub object_mask_model: lightcraft_develop::ObjectModel,
     pub startup_view: StartupView,
     /// Ask before moving photos to Recently Deleted (keyboard and menu).
     pub confirm_delete: bool,
@@ -161,6 +165,8 @@ impl Default for AppSettings {
         AppSettings {
             library_path: String::new(),
             sam_model_dir: String::new(),
+            sam1_model_file: String::new(),
+            object_mask_model: lightcraft_develop::ObjectModel::Sam3,
             startup_view: StartupView::Last,
             confirm_delete: false,
             gpu: true,
@@ -182,6 +188,8 @@ mod app_settings_tests {
     fn app_settings_without_model_directory_deserialize_to_default() {
         let settings: AppSettings = serde_json::from_str("{}").expect("defaulted settings");
         assert!(settings.sam_model_dir.is_empty());
+        assert!(settings.sam1_model_file.is_empty());
+        assert_eq!(settings.object_mask_model, lightcraft_develop::ObjectModel::Sam3);
     }
 }
 

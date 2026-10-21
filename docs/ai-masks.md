@@ -1,6 +1,7 @@
 # AI masks (Object and Describe)
 
-LightCraft selects objects with **SAM 3** (Segment Anything with Concepts, Meta 2025), run in
+LightCraft selects objects with **SAM 3** (Segment Anything with Concepts, Meta 2025), or an
+optional **SAM 1 ViT-B** backend for click-based Object selection. Both run in
 `crates/segment` on [candle](https://github.com/huggingface/candle): Metal on macOS,
 NVIDIA CUDA in an optional `cuda` build, and CPU otherwise. The CUDA build uses NVIDIA
 runtime libraries; those are bundled in the Windows portable package.
@@ -14,9 +15,10 @@ below) works, and no render, export or command ever waits for it.
 In the Masking panel (M):
 
 - **AI Sky / AI People:** one-click SAM 3 text selections for `sky` and `person`.
-- **AI Subject / AI Background:** select `main subject`, or its complement. These are text
-  prompts, so ambiguous photos may need a more specific description or Object clicks.
-  Scripts can supply `text`, e.g. `mask.add {"kind":"aiBackground", "text":"dog"}`.
+- **AI Subject / AI Background:** describe the subject to select, such as `person`, `rocket`
+  or `cup`. Background selects its complement. Both ask for a concrete description;
+  SAM 3 does not reliably interpret the generic phrase `main subject`.
+  Scripts must supply `text`, e.g. `mask.add {"kind":"aiBackground", "text":"dog"}`.
   Background inversion is stored with the component, including background worker results,
   and works with Add / Subtract / Intersect. A failed or empty selection never creates an
   all-image background mask. The existing Subject / Sky / Background tiles remain the fast
@@ -53,6 +55,44 @@ need the model, so masks survive moving the library to a machine without it, and
 renders them. Editing the photo's look later does not recompute a mask (click again to update).
 
 ## Getting the model
+
+### Ungated Object selection with SAM 1
+
+The Masking panel's **Object selection model** choice applies to new Object masks. Select
+**SAM 1 · clicks (ungated)** to use the Apache-2.0 model, then explicitly choose
+**Download Object model (375 MB)**. This downloads model weights to this computer; inference
+uses the local photo and does not upload it. The download can be cancelled and resumed and
+checks the pinned SHA-256 before publishing the file. Merely choosing SAM 1 starts no download.
+Describe and AI Sky / People / Subject / Background still require SAM 3 and its access approval.
+Existing Object masks retain their saved backend; older libraries without a backend field use
+SAM 3. A missing model never changes the backend automatically.
+On a fresh launch with no saved preferences, a package containing SAM 1 selects it for new
+Object masks. Saved preferences retain their model choice.
+
+The checkpoint is Kornia's F32 safetensors conversion of Meta's SAM 1 ViT-B, from
+[`kornia/sam` revision b6e8348](https://huggingface.co/kornia/sam/tree/b6e8348387e0296715f9e4a0a766b59c19a691fd):
+`sam_vit_b_01ec64.safetensors`, 374,979,376 bytes,
+SHA-256 `fbf4c1ad844a2e9b867d89dc04a61f3ece19c57ebb7d8fcb6da92062a291d839`.
+The [Apache-2.0 licence](https://huggingface.co/kornia/sam/blob/b6e8348387e0296715f9e4a0a766b59c19a691fd/LICENSE)
+covers the model; the separately licensed SA-1B dataset is not included.
+
+Native startup checks `LIGHTCRAFT_SAM1_MODEL`, a saved path, an exact-sized bundled
+`models/sam1/sam_vit_b_01ec64.safetensors`, then the app's writable models folder.
+Setup commands are `segment.sam1.status`, `segment.sam1.download {"acknowledged":true}`,
+and `segment.sam1.cancel`. Object creation accepts `mask.add {"kind":"object","model":"sam1"}`;
+scripts can also set `Segmenter.sam1_model` before calling the engine directly.
+
+The encoder preserves aspect ratio with a 1024-pixel long edge; padded decoder logits are
+un-padded into an image-covering 256-square grid before storing the mask. Real-checkpoint
+inference passed on an RTX 4090 for square, portrait and landscape photos, including positive
+and negative clicks, detail refinement, rendering and undo. A normal desktop session verified
+checkpoint repair and selection followed by native Remove. The previously released r3 package
+does not contain this backend. These checks do not establish reference-model numerical parity.
+
+SAM 3 also passed local RTX 4090 checks for click selection, `person`, `sky`, and a described
+background (`person` with inversion). Generic `main subject` failed on the test photos;
+Subject and Background therefore require a description. These are bounded smoke tests,
+not a broad accuracy evaluation or evidence of Lightroom parity.
 
 ### Why SAM 3 for photos rather than SAM 3.1?
 
@@ -179,9 +219,9 @@ Therefore:
 
 | Command | Params | |
 |---|---|---|
-| `mask.add` | `{kind: "object", points?: [[x,y],…], exclude?: [[x,y],…], seg?}` | an Object mask (empty until clicked) |
+| `mask.add` | `{kind: "object", model?: "sam1"\|"sam3", points?: [[x,y],…], exclude?: [[x,y],…], seg?}` | an Object mask (empty until clicked); scripts default to SAM 3 |
 | `mask.add` | `{kind: "prompt", text, seg?}` | a Describe mask |
-| `mask.add` | `{kind: "aiSky"\|"aiPeople"\|"aiSubject"\|"aiBackground", text?, seg?, invert?, name?}` | SAM 3 preset; background complements the selected subject; `invert` toggles it |
+| `mask.add` | `{kind: "aiSky"\|"aiPeople"\|"aiSubject"\|"aiBackground", text?, seg?, invert?, name?}` | SAM 3 selection; `text` required for Subject / Background; background complements it; `invert` toggles it |
 | `mask.addComponent` | `{op: add\|subtract\|intersect, kind: "object"\|"prompt", …}` | the same as a component |
 | `mask.objectPoint` | `{x, y, exclude?: bool, id?}` | one click on the selected mask's Object selection (≤ 64 clicks) |
 | `mask.refineDetail` | `{id?, component?}` | the zoomed-in detail pass → `{started}` |
@@ -189,6 +229,9 @@ Therefore:
 | `segment.model.status` | `{}` | `{available, installed, dir, loaded, busy, analyzing, sizeBytes, license, licenseUrl, mirrors, download}` |
 | `segment.model.download` | `{acknowledged: true}` | start the download in the background → `{started}` |
 | `segment.model.cancel` | `{}` | stop it (it resumes next time) → `{cancelled}` |
+| `segment.sam1.status` | `{}` | local Object-model file, installed and background download state |
+| `segment.sam1.download` | `{acknowledged: true}` | verify/repair the pinned local file or download it in the background |
+| `segment.sam1.cancel` | `{}` | cancel SAM 1 download, retaining a resumable partial |
 
 Coordinates are normalized to the uncropped, oriented photo, like every mask shape. `seg` passes
 a stored segmentation (as `mask.list` / the develop settings hold it): the mask is made without
