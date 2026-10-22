@@ -16,6 +16,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fancy-regex = "0.17"
+unicode-normalization = "0.1"
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }

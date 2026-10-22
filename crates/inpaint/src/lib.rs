@@ -9,10 +9,23 @@ pub use model::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod download;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod klein_download;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod klein_sampling;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod klein_text;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod klein_tokenizer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod klein_transformer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod klein_vae;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod migan;
 #[cfg(not(target_arch = "wasm32"))]
 mod tokenizer;
 #[cfg(not(target_arch = "wasm32"))]
-mod weights;
+#[doc(hidden)]
+pub mod weights;
 #[cfg(not(target_arch = "wasm32"))]
 pub use download::{LICENSE_NAME, LICENSE_URL, MODEL_BYTES, MODEL_FILES, MODEL_REVISION, ModelFile, download, installed};

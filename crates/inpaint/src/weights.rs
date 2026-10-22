@@ -24,12 +24,36 @@ pub struct Weights {
     data_start: u64,
 }
 
+/// Allocation policies for the pinned model families. Existing models retain
+/// their smaller bound; opting into Klein never removes the allocation limit.
+#[derive(Clone, Copy)]
+pub enum TensorLimit {
+    Standard,
+    KleinTransformer,
+    KleinText,
+}
+
+impl TensorLimit {
+    fn bytes(self) -> usize {
+        match self {
+            Self::Standard => 128 << 20,
+            Self::KleinTransformer => 192 << 20,
+            // Qwen3's BF16 token embedding is 777,912,320 bytes.
+            Self::KleinText => 768 << 20,
+        }
+    }
+}
+
 impl Weights {
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
 
     pub fn open(path: &Path) -> Result<Arc<Self>> {
+        Self::open_with_limit(path, TensorLimit::Standard)
+    }
+
+    pub fn open_with_limit(path: &Path, limit: TensorLimit) -> Result<Arc<Self>> {
         let mut file = File::open(path).map_err(|e| Error::Model(format!("{}: {e}", path.display())))?;
         let file_len = file.metadata()?.len();
         let mut prefix = [0u8; 8];
@@ -51,9 +75,10 @@ impl Weights {
             }
             let dtype = match value.get("dtype").and_then(serde_json::Value::as_str) {
                 Some("F16") => DType::F16,
+                Some("BF16") => DType::BF16,
                 Some("F32") => DType::F32,
                 Some("I64") => DType::I64,
-                _ => return Err(Error::Model(format!("unsupported dtype for {name}; expected F16, F32 or I64"))),
+                _ => return Err(Error::Model(format!("unsupported dtype for {name}; expected F16, BF16, F32 or I64"))),
             };
             let shape: Vec<usize> = value
                 .get("shape")
@@ -76,9 +101,8 @@ impl Weights {
                 .iter()
                 .try_fold(dtype.size_in_bytes(), |a, n| a.checked_mul(*n))
                 .ok_or_else(|| Error::Model(format!("oversized tensor {name}")))?;
-            // The largest supported tensor is CLIP's 75 MiB token embedding. A corrupt
-            // header cannot request allocation of the entire multi-GB model as one tensor.
-            if size > (128 << 20) {
+            // A corrupt header cannot request the entire multi-GB model at once.
+            if size > limit.bytes() {
                 return Err(Error::Model(format!("tensor {name} exceeds the allocation limit")));
             }
             if end.checked_sub(start) != Some(size as u64) || header_len.checked_add(8).and_then(|n| n.checked_add(end)).is_none_or(|n| n > file_len)
@@ -106,6 +130,47 @@ impl Weights {
 
 pub struct Backend(pub Arc<Weights>);
 
+/// A bounded set of safetensors shards with unambiguous tensor ownership.
+pub struct MultiBackend {
+    shards: Vec<Arc<Weights>>,
+    owners: HashMap<String, usize>,
+}
+
+impl MultiBackend {
+    pub fn new(shards: Vec<Arc<Weights>>) -> Result<Self> {
+        if shards.is_empty() || shards.len() > 8 {
+            return Err(Error::Model("model requires between one and eight weight shards".into()));
+        }
+        let mut owners = HashMap::new();
+        for (index, shard) in shards.iter().enumerate() {
+            for name in shard.entries.keys() {
+                if owners.insert(name.clone(), index).is_some() {
+                    return Err(Error::Model(format!("duplicate tensor across weight shards: {name}")));
+                }
+            }
+        }
+        Ok(Self { shards, owners })
+    }
+
+    fn shard(&self, name: &str) -> candle_core::Result<&Arc<Weights>> {
+        self.owners.get(name).and_then(|index| self.shards.get(*index)).ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {name}")))
+    }
+}
+
+impl SimpleBackend for MultiBackend {
+    fn get(&self, shape: Shape, name: &str, init: candle_nn::Init, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+        Backend(Arc::clone(self.shard(name)?)).get(shape, name, init, dtype, device)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+        self.shard(name)?.read(name, dtype, device)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.owners.contains_key(name)
+    }
+}
+
 impl SimpleBackend for Backend {
     fn get(&self, shape: Shape, name: &str, _init: candle_nn::Init, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
         let entry = self.0.entries.get(name).ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {name}")))?;
@@ -131,6 +196,61 @@ impl SimpleBackend for Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture(name: &str, tensor: &str, dtype: &str, data: &[u8], elements: usize) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("lc-inpaint-{name}-{}.safetensors", std::process::id()));
+        let header = serde_json::json!({tensor: {"dtype": dtype, "shape": [elements], "data_offsets": [0, data.len()]}}).to_string();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(data);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn bfloat16_tensor_loads_with_correct_byte_order() {
+        let path = fixture("bf16", "x", "BF16", &[0x80, 0x3f, 0, 0xc0], 2);
+        let weights = Weights::open(&path).unwrap();
+        assert_eq!(weights.read("x", DType::F32, &Device::Cpu).unwrap().to_vec1::<f32>().unwrap(), [1.0, -2.0]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shard_lookup_checks_names_shapes_and_duplicates() {
+        let first = fixture("shard-first", "x", "BF16", &[0x80, 0x3f], 1);
+        let second = fixture("shard-second", "y", "BF16", &[0, 0xc0], 1);
+        let x = Weights::open(&first).unwrap();
+        let y = Weights::open(&second).unwrap();
+        assert!(MultiBackend::new(vec![]).is_err());
+        assert!(MultiBackend::new(vec![Arc::clone(&x); 9]).is_err());
+        assert!(MultiBackend::new(vec![Arc::clone(&x), Arc::clone(&x)]).is_err());
+        let backend = MultiBackend::new(vec![x, y]).unwrap();
+        assert!(backend.contains_tensor("y"));
+        assert!(!backend.contains_tensor("absent"));
+        assert_eq!(backend.get_unchecked("y", DType::F32, &Device::Cpu).unwrap().to_vec1::<f32>().unwrap(), [-2.0]);
+        assert!(backend.get_unchecked("absent", DType::F32, &Device::Cpu).is_err());
+        assert!(backend.get(Shape::from((2,)), "x", candle_nn::Init::Const(0.), DType::F32, &Device::Cpu).is_err());
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn larger_models_require_explicit_bounded_policy() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("lc-inpaint-policy-{}.safetensors", std::process::id()));
+        for (elements, transformer_ok, text_ok) in [(84_934_656u64, true, true), (388_956_160, false, true), (402_653_185, false, false)] {
+            let header = serde_json::json!({"x": {"dtype":"BF16", "shape":[elements], "data_offsets":[0,elements * 2]}}).to_string();
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+            file.write_all(header.as_bytes()).unwrap();
+            file.set_len(8 + header.len() as u64 + elements * 2).unwrap();
+            drop(file);
+            assert!(Weights::open(&path).is_err());
+            assert_eq!(Weights::open_with_limit(&path, TensorLimit::KleinTransformer).is_ok(), transformer_ok);
+            assert_eq!(Weights::open_with_limit(&path, TensorLimit::KleinText).is_ok(), text_ok);
+        }
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn oversized_tensor_is_rejected_before_allocation() {

@@ -39,6 +39,33 @@ context. crates/inpaint is therefore licensed under Apache-2.0 only (LICENSE-APA
 The SD 1.5 inpainting model weights are not distributed with LightCraft. Users download
 them separately under CreativeML OpenRAIL-M; see docs/generative-fill.md.
 
+crates/inpaint/src/klein_text.rs adapts Candle 0.9.2's Qwen3 implementation
+(https://github.com/huggingface/candle, MIT OR Apache-2.0) into a bounded,
+cancellable feature encoder for FLUX.2 Klein. The Rust adaptation omits unused
+language-model layers and the output head. Klein model weights remain separate.
+
+crates/inpaint/src/klein_transformer.rs ports Flux2Transformer2DModel from
+Hugging Face Diffusers 0.38.0, Copyright 2025 Black Forest Labs, The HuggingFace
+Team and The InstantX Team, licensed Apache-2.0. Modified by LightCraft
+contributors (2026): Rust/Candle inference, bounded query-tiled attention and
+cooperative cancellation. Public FLUX.2-klein-4B checkpoint revision
+e7b7dc27f91deacad38e78976d1f2b499d76a294 is separately licensed Apache-2.0;
+the current portable package does not include it.
+
+crates/inpaint/src/klein_vae.rs implements the Diffusers AutoencoderKLFlux2
+architecture and checkpoint naming using Candle's Stable Diffusion blocks
+(MIT OR Apache-2.0). The reference architecture is from Hugging Face Diffusers
+0.38.0 (Apache-2.0). The tokenizer is a Rust implementation of the public Klein
+checkpoint's Qwen2 BPE configuration, using permissively licensed Rust Unicode
+normalization and regular-expression libraries. No tokenizer assets or model
+weights are committed to this repository.
+
+crates/inpaint/src/klein_sampling.rs adapts the schedule, latent packing and
+inpainting operations from Diffusers 0.38.0 Flux2KleinInpaintPipeline and
+FlowMatchEulerDiscreteScheduler (Apache-2.0), Copyright 2025 Black Forest Labs,
+The HuggingFace Team and The InstantX Team. Modified by LightCraft contributors
+(2026) for bounded Rust/Candle inference and the pinned Klein 4B configuration.
+
 crates/inpaint/src/migan.rs ports the MIT-licensed MI-GAN inference architecture
 from Picsart AI Research (PAIR), Copyright (c) 2024, at revision
 2b793c5ece43f4253e32d4afc257120a5deed6f5 of
