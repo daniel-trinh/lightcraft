@@ -7,12 +7,15 @@ recorded in SHA256-MANIFEST.json; the default build targets the RTX 4090 (8.9).
 
 Fill and Remove
 1. Import a photo and create a mask around the area to change.
-2. Open Remove and choose Remove to reconstruct the background. Its small
-   MIT-licensed model is included in the models folder; no download is needed.
-3. For prompt-based Fill, read the model licence, then choose Download model.
-   The one-time Fill download is approximately 2.13 GB and can be resumed.
-   Enter a replacement prompt and choose Fill. Each result appears as a new photo
-   beside its source. Neither operation uploads your photo.
+2. Open Remove. The NVIDIA CUDA build uses Klein by default. If model setup is
+   needed, review the Apache-2.0 licence and choose Download model (about 16 GB).
+   Downloads resume and verify pinned files. If models/flux2-klein-4b is already
+   included in this package, Fill and Remove are ready without a download.
+3. Fill takes your replacement description. Remove uses a fixed background
+   continuation prompt; select the whole distraction, including its shadow.
+   Each result appears as a new photo beside its source. The original is kept.
+4. The earlier bundled MIT-licensed MI-GAN Remove and separately downloaded
+   SD 1.5 Fill remain available under Compatibility options.
 
 AI masks
 Object selection can use the Apache-2.0 SAM 1 model with clicks to include and
@@ -34,7 +37,6 @@ uploaded to an AI service. Generative results can contain mistakes: inspect each
 result before exporting. Your source photo is retained. Undo removes a generated
 photo from the catalog while keeping its PNG on disk for recovery.
 
-Keep the bundled licence files with this package. The included MI-GAN removal
-weights have an MIT licence in models/licenses. Bundled SAM 1 weights have an
-Apache-2.0 licence there too. Fill and SAM 3 have their own licences and are
-obtained separately during setup.
+Keep the bundled licence files with this package. MI-GAN's MIT licence and any
+bundled SAM 1 or Klein Apache-2.0 licences are under models/licenses. The
+legacy SD 1.5 Fill and separately obtained SAM 3 have their own licences.

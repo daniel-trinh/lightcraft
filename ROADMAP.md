@@ -6,13 +6,19 @@ projects (DrawCraft reached its first four milestones in ≈ 4½ h) and are revi
 
 ## Where we stand
 
-**AI fork update, 2026-10-20 (development branch):** optional SAM 3 selects sky, people and described subjects
-or backgrounds, with model results stored in masks. Native MI-GAN removal and app-managed SD 1.5 prompt Fill
-use a selected mask and create a new PNG/catalog photo. The portable packager now includes the
-small MIT-licensed removal model; prompt Fill offers a separate model download. This is still under validation:
-real Fill/Remove tests pass on procedural images,
-but real-photo quality remains inconsistent: fabric replacement/removal worked on a NASA portrait,
-while spoon removal in a CC0 coffee photo invented another structure. The RTX 4090 CUDA build
+**AI fork update, 2026-10-22 (development branch):** optional SAM 3 selects sky, people and described subjects
+or backgrounds, with model results stored in masks. Native FLUX.2 Klein 4B CUDA Fill and Remove
+are integrated into the engine and UI. The pinned public Apache-2.0 model is about 16 GB, with
+verified app-managed setup or optional `-KleinModelDir` portable bundling; inference needs an
+NVIDIA GPU but no Python, server or photo upload. Remove uses a generic background prompt and
+erased-mask conditioning; Fill uses the supplied prompt and full-image conditioning. The source
+is retained and model output is blended through the original soft mask into a separate PNG/catalog
+photo. The older MI-GAN Remove and SD 1.5 Fill remain as compatibility paths. Normal desktop Fill/Remove button checks passed source/settings preservation and undo;
+fresh package validation is recorded with the release artifacts. Focused native Klein CUDA
+checks included 1024-pixel VAE parity and visually inspected NASA-badge/coffee-spoon Remove
+and badge Fill examples; these do not prove broad quality. Historical SD 1.5/MI-GAN QA remains
+mixed: fabric replacement/removal worked on a NASA portrait, while spoon removal in a CC0
+coffee photo invented another structure. The earlier RTX 4090 CUDA build
 has run real inference and its portable app launched with only Windows system directories on PATH.
 The native MI-GAN core matches the author's raw ONNX results on three CPU fixtures and a CUDA fixture.
 The portable preflight passed two normal Remove button actions without the Fill model installed,
@@ -24,8 +30,9 @@ square, portrait and landscape photo checks on the RTX 4090, including negative 
 rendering and undo. Its ungated setup also passed same-sized corrupt-file repair and normal
 desktop masking followed by Remove. These checks do not establish broad accuracy or numerical
 parity with the reference SAM implementations. Native output
-now retains the cropped photo resolution up to 64 MP; the model processes a context patch at up
-to 512 px. An optional CUDA build targets NVIDIA GPUs; ordinary Windows builds still use CPU.
+retains the cropped photo resolution up to 64 MP; Klein uses a context patch at up to 1024 px,
+while the legacy models use up to 512 px. The optional CUDA build targets NVIDIA GPUs; ordinary
+Windows builds still use CPU for the legacy paths.
 The upstream readiness estimates below
 remain historical; this does not establish Lightroom AI parity.
 
@@ -48,7 +55,7 @@ duplicate Local entries #22, black GPU exports on an Intel iGPU #78).
 | **Feature checklist** | 79% | P0 core and P1 nearly complete: import (Add / Copy / Move, templates, devices), library, grid/loupe/compare/survey, every Edit slider, curves, colour grading, masking tools, crop/Upright, heal/clone, presets/profiles, versions/history, sync, export, menus, shortcuts | P1: lens-profile database, content-aware fill (patch synthesis), video playback/trim |
 | **RAW coverage** (formats people shoot) | ~55% | DNG (all kinds), CR2, ARW, NEF (uncompressed + Huffman lossless/lossy), uncompressed RAF/ORF, RW2 / RWL / Panasonic RAW (every raw format, checked on 178 files from 118 Panasonic and Leica bodies), PEF; every container's embedded preview (incl. CR3) | **CR3** (every Canon since ~2018), compressed RAF/ORF, Nikon lossy-after-split, Canon sRAW, HEIC/AVIF. NEFs labelled compressed but stored uncompressed (Z 6 packed 14-bit, D850 12-bit uncompressed). Per-model verification is thin (~55 corpus files vs >1,000 models) |
 | **Colour & image quality** | ~55–65% | Pipeline is complete and fast; GPU path CPU-exact within 1/255 | **No measured camera calibration database**: ARW, NEF and RW2 have a guarded per-file embedded-JPEG colour estimate (docs/camera-preview-colour.md); other non-DNG raws and rejected estimates use a neutral matrix. Colour fidelity remains incomplete. No lens-profile database. No measured fidelity against Lightroom (tone, highlights, texture/clarity, NR, sharpening are tuned by eye) |
-| **AI & computational** | ~15–20% | Assisted culling (focus, bursts), auto tone, HDR/panorama merge; subject/sky/background masks as classical heuristics | Real segmentation masks (subject, sky, people, objects, landscape, depth), AI denoise, super resolution, lens blur, generative remove, faces/people, natural-language search. **Blocked on a model strategy** (licensable weights or our own training; pure-Rust inference is feasible) |
+| **AI & computational** | ~15–20% | Assisted culling (focus, bursts), auto tone, HDR/panorama merge; optional SAM masks; native Klein CUDA Fill/Remove, with legacy MI-GAN/SD 1.5 paths | Broadly verified mask and generation quality, AI denoise, super resolution, lens blur, faces/people, natural-language search. Segmentation licensing and further model choices remain open |
 | **Workflow & library** | ~85% (single machine) | Robust catalog (journal + snapshots, background compaction, crash-tested), 85k-photo libraries stay responsive, Local browsing with automatic cleanup, XMP interop, keywords, smart albums, Move import | Opening an 85k library takes 1.7–4.7 s; no cloud sync (out of scope), no tablet companion (#74, roadmap), shared albums, publish services, tethering |
 | **Classic modules** | ~30% | Geotagging from GPX track logs, soft proofing (partial), slideshow (basic) | **Map view, Book, Print, Slideshow module, Web, publish services**: ~40 tracker rows ⬜ |
 | **HDR & video** | 0% | | HDR edit/display/export; video play/trim/edit/export |
@@ -173,8 +180,9 @@ The milestone estimates in the table above were made before work started and are
 
 ## Risks that coding hours alone don't retire
 
-- **AI features** (subject/sky/people masks, generative remove) need model weights with licences we can ship; classical
-  fallbacks first. No permissively licensed sky-segmentation or raw-denoise model was found — we may need to train our own.
+- **AI features:** Klein provides Apache-2.0 weights for native CUDA Fill/Remove, but broad photographic quality
+  remains open. App/package validation is specific to the tested GPU and release. Other tasks, especially raw denoise, still need
+  suitable model strategies; no permissively licensed raw-denoise model has been established here.
 - **Camera colour and lens data** is a data problem: we never use Adobe's matrices, DCPs or LCPs. DNG-embedded data first,
   then our own calibration; long-tail camera/lens coverage grows over time.
 - **Raw-format sources:** decided 2026-10-05: decoders are written from *prose* format descriptions (even ones

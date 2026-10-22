@@ -12,6 +12,7 @@ param(
   [Parameter(Mandatory = $true)][string] $CudaRoot,
   [Parameter(Mandatory = $true)][string] $MiganModel,
   [string] $Sam1Model,
+  [string] $KleinModelDir,
   [Parameter(Mandatory = $true)][string] $OutDir
 )
 $ErrorActionPreference = 'Stop'
@@ -27,6 +28,47 @@ if ($Sam1Model) {
   if ((Get-Item -LiteralPath $Sam1Model).Length -ne 374979376 -or
       (Get-FileHash -LiteralPath $Sam1Model -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'fbf4c1ad844a2e9b867d89dc04a61f3ece19c57ebb7d8fcb6da92062a291d839') {
     throw 'Object model does not match the pinned SAM 1 ViT-B safetensors checkpoint. See docs/sam1-model.md.'
+  }
+}
+if ($KleinModelDir) {
+  $KleinModelDir = (Resolve-Path -LiteralPath $KleinModelDir -ErrorAction Stop).Path
+  if (-not (Test-Path -LiteralPath $KleinModelDir -PathType Container)) { throw "Klein model directory is missing: $KleinModelDir" }
+  $kleinContract = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'klein-model.json') -Raw | ConvertFrom-Json
+  if ($kleinContract.model -cne 'black-forest-labs/FLUX.2-klein-4B' -or
+      $kleinContract.revision -cne 'e7b7dc27f91deacad38e78976d1f2b499d76a294' -or
+      $kleinContract.license -cne 'Apache-2.0' -or
+      [long]$kleinContract.total_bytes -ne 15975644852 -or
+      @($kleinContract.files).Count -ne 6) {
+    throw 'The Klein packaging manifest is not the pinned public 4B release contract.'
+  }
+  $kleinValidatedFiles = @()
+  $kleinSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  [long]$kleinTotal = 0
+  foreach ($entry in $kleinContract.files) {
+    $folder = [string]$entry.folder
+    $name = [string]$entry.name
+    if ($folder -cnotin @('', 'transformer', 'text_encoder', 'vae', 'tokenizer') -or
+        $name -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$' -or $name.Contains('..')) {
+      throw "Unsafe Klein model path in packaging manifest: $folder/$name"
+    }
+    $relative = if ($folder) { Join-Path $folder $name } else { $name }
+    if (-not $kleinSeen.Add($relative)) { throw "Duplicate Klein model path in packaging manifest: $relative" }
+    [long]$expectedBytes = $entry.bytes
+    $expectedHash = [string]$entry.sha256
+    if ($expectedBytes -le 0 -or $expectedHash -cnotmatch '^[0-9a-f]{64}$') {
+      throw "Invalid Klein model size or SHA256 in packaging manifest: $relative"
+    }
+    $source = Join-Path $KleinModelDir $relative
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or (Get-Item -LiteralPath $source).Length -ne $expectedBytes -or
+        (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedHash) {
+      throw "Klein model file differs from the pinned public checkpoint: $relative"
+    }
+    if ($expectedBytes -gt [long]::MaxValue - $kleinTotal) { throw 'Klein model byte total overflows Int64.' }
+    $kleinTotal += $expectedBytes
+    $kleinValidatedFiles += [pscustomobject]@{ relative = $relative; source = $source }
+  }
+  if ($kleinTotal -ne [long]$kleinContract.total_bytes -or -not $kleinSeen.Contains('LICENSE.md')) {
+    throw 'Klein model files do not close over the pinned 15,975,644,852-byte release contract.'
   }
 }
 $CudaRoot = (Resolve-Path -LiteralPath $CudaRoot -ErrorAction Stop).Path
@@ -142,6 +184,16 @@ try {
     Copy-Item -LiteralPath (Join-Path $Root 'docs/licenses/SAM1-LICENSE.txt') -Destination $modelLicenses
     Copy-Item -LiteralPath (Join-Path $Root 'docs/sam1-model.md') -Destination (Join-Path $sam1Folder 'PROVENANCE.md')
   }
+  if ($KleinModelDir) {
+    $kleinFolder = Join-Path $modelFolder 'flux2-klein-4b'
+    New-Item -ItemType Directory -Path $kleinFolder | Out-Null
+    foreach ($entry in $kleinValidatedFiles) {
+      $destination = Join-Path $kleinFolder $entry.relative
+      New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+      Copy-Item -LiteralPath $entry.source -Destination $destination
+    }
+    Copy-Item -LiteralPath (Join-Path $KleinModelDir 'LICENSE.md') -Destination (Join-Path $modelLicenses 'FLUX2-KLEIN-LICENSE.md')
+  }
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README-CUDA.txt') -Destination (Join-Path $portable 'START-HERE.txt')
   foreach ($dll in $requiredDlls) { Copy-Item -LiteralPath $runtime[$dll] -Destination (Join-Path $portable $dll) }
   foreach ($file in @('README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE')) {
@@ -208,9 +260,34 @@ try {
   try { $version = ((& cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq 'lightcraft' | Select-Object -ExpandProperty version -First 1) }
   finally { Pop-Location }
   $manifest = [ordered]@{ product = 'LightCraft CUDA portable'; version = $version; architecture = 'x86_64'; cuda_toolkit = '12.8.1'; cuda_compute_capability = $env:CUDA_COMPUTE_CAP; source_revision = $buildSha; source_worktree_dirty = $sourceDirty; dependencies = $dependencies; files = @($files) }
+  if ($KleinModelDir) {
+    $manifest['klein_model'] = [ordered]@{ model = $kleinContract.model; revision = $kleinContract.revision; license = $kleinContract.license; bundled_bytes = $kleinTotal; runtime_files = $kleinValidatedFiles.Count; location = 'models/flux2-klein-4b' }
+  }
   $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $portable 'SHA256-MANIFEST.json') -Encoding utf8
   $zip = Join-Path $stage 'LightCraft-CUDA-portable.zip'
-  Compress-Archive -LiteralPath $portable -DestinationPath $zip
+  if ($KleinModelDir) {
+    # Compress-Archive has a per-entry 2 GB limit. ZipFile writes ZIP64 entries
+    # for the 7.75 GB transformer and 4.97 GB Qwen shard.
+    [IO.Compression.ZipFile]::CreateFromDirectory($portable, $zip, [IO.Compression.CompressionLevel]::Fastest, $true)
+    $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+    try {
+      foreach ($entry in $kleinContract.files) {
+        $relative = if ($entry.folder) { "$($entry.folder)/$($entry.name)" } else { [string]$entry.name }
+        $zipEntry = $archive.GetEntry("LightCraft-CUDA-portable/models/flux2-klein-4b/$relative")
+        if (-not $zipEntry -or $zipEntry.Length -ne [long]$entry.bytes) { throw "ZIP64 archive is missing the pinned Klein model file: $relative" }
+      }
+    } finally { $archive.Dispose() }
+  } else {
+    Compress-Archive -LiteralPath $portable -DestinationPath $zip
+  }
+  $resolvedParent = [IO.Path]::GetFullPath($parent).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+  $resolvedStage = [IO.Path]::GetFullPath($stage)
+  $resolvedOut = [IO.Path]::GetFullPath($OutDir)
+  if (-not $resolvedStage.StartsWith($resolvedParent, [StringComparison]::OrdinalIgnoreCase) -or
+      $resolvedStage -notmatch '\.lightcraft-cuda-stage-[0-9a-f]{32}$' -or
+      [IO.Path]::GetDirectoryName($resolvedOut).TrimEnd([IO.Path]::DirectorySeparatorChar) -cne $resolvedParent.TrimEnd([IO.Path]::DirectorySeparatorChar)) {
+    throw 'Staging and output paths must remain under the verified output parent.'
+  }
   Move-Item -LiteralPath $stage -Destination $OutDir
 } catch {
   $resolvedParent = [IO.Path]::GetFullPath($parent).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar

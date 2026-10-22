@@ -69,6 +69,17 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) { Err(Error::Cancelled) } else { Ok(()) }
 }
 
+fn validate_model_mask(mask: &[u8], width: usize, height: usize) -> Result<()> {
+    // Bilinear reduction can miss a very narrow selection between latent-grid
+    // sample centres. Reject it before loading models rather than report an
+    // apparent edit that never denoised any selected token.
+    let packed = klein_sampling::packed_mask(mask, width, height, DType::F32, &Device::Cpu)?;
+    if packed.max_all()?.to_scalar::<f32>()? <= 0.0 {
+        return Err(Error::Model("The selection is too small or narrow for this model; enlarge the mask around the object and try again".into()));
+    }
+    Ok(())
+}
+
 fn validate_input(rgb: &[u8], mask: &[u8], width: usize, height: usize, options: &KleinOptions) -> Result<()> {
     if !(64..=1024).contains(&width) || !(64..=1024).contains(&height) || !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(Error::Model("Klein image dimensions must be 64..=1024 and divisible by 16".into()));
@@ -232,6 +243,7 @@ pub fn generate(
 ) -> Result<Vec<u8>> {
     validate_input(rgb, mask, width, height, options)?;
     check_cancel(cancel)?;
+    validate_model_mask(mask, width, height)?;
     let device = best_device()?;
     if !matches!(device, Device::Cuda(_)) {
         return Err(Error::Model("Klein 4B generation requires an NVIDIA CUDA GPU; CPU inference is unsupported".into()));
@@ -323,5 +335,18 @@ mod tests {
         assert_eq!(rgb, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert!(erase_selected_rgb(&rgb[..8], &mask).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn a_selection_missed_by_the_latent_grid_is_actionable_before_loading() {
+        let mut mask = vec![0; 64 * 64];
+        mask[0] = 255;
+        let rgb = vec![127; 64 * 64 * 3];
+        let error = generate(Path::new("absent-model"), &rgb, &mask, 64, 64, &KleinOptions::default(), &AtomicBool::new(false), &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("enlarge the mask"), "{error}");
+        mask.fill(255);
+        assert!(validate_model_mask(&mask, 64, 64).is_ok());
     }
 }

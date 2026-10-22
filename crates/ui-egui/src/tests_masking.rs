@@ -853,7 +853,8 @@ fn installed_sam_dialog_continues_to_subject_description() {
 #[test]
 fn native_generation_setup_requires_consent_and_no_external_server_fields() {
     use lightcraft_engine::generative_model::Generator;
-    let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), Services::default());
+    let mut app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), Services::default());
+    app.ui.settings.generative_use_klein = false;
     let mut h = Headless::new(app, [1200.0, 1400.0], 1.0);
     assert_eq!(h.request("ui.set", json!({"view":"detail"}), T)["ok"], true);
     assert_eq!(h.request("engine.execute", json!({"command":"panel.remove"}), T)["ok"], true);
@@ -880,4 +881,43 @@ fn native_generation_setup_requires_consent_and_no_external_server_fields() {
     assert!(saved.get("generativeModelAck").is_none());
     let restored: crate::state::UiState = serde_json::from_value(saved).unwrap();
     assert!(!restored.generative_model_ack);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn klein_setup_defaults_to_local_model_without_starting_download_or_generation() {
+    use lightcraft_engine::generative_model::Generator;
+
+    if !Generator::KLEIN_AVAILABLE {
+        return;
+    }
+    let mut app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), Services::default());
+    assert!(app.ui.settings.generative_use_klein);
+    let model_dir = std::env::temp_dir().join(format!("lc-ui-klein-absent-{}", std::process::id()));
+    app.session.generator.klein_dir = Some(model_dir);
+    let mut h = Headless::new(app, [1200.0, 1400.0], 1.0);
+    assert_eq!(h.request("ui.set", json!({"view":"detail"}), T)["ok"], true);
+    assert_eq!(h.request("engine.execute", json!({"command":"panel.remove"}), T)["ok"], true);
+    exec(&mut h, "mask.add", json!({"kind":"radial", "center":[0.5,0.5], "rx":0.2, "ry":0.2}));
+    h.step();
+
+    assert!(!h.app.session.generator.klein_installed());
+    for id in ["button:generativeDownloadModel", "button:generativeFill", "button:generativeRemove"] {
+        assert!(h.app.widgets.iter().any(|(widget, _)| widget == id), "missing {id}");
+    }
+    for id in ["field:generativeNegative", "field:generativeEndpoint", "field:generativeCheckpoint", "checkbox:generativeModelConsent"] {
+        assert!(!h.app.widgets.iter().any(|(widget, _)| widget == id), "unexpected {id}");
+    }
+    assert!(!h.app.session.generator.klein_download_status().running);
+    assert!(!h.app.session.generator.download_status().running);
+
+    // The selected mask and missing model make both actions ineligible; clicking their
+    // registered widget locations must not start inference or a download.
+    for id in ["button:generativeFill", "button:generativeRemove"] {
+        let result = h.request("ui.clickWidget", json!({"id":id}), T);
+        assert_eq!(result["ok"], true, "{id}: {result}");
+    }
+    assert!(!h.app.tasks.is_running("Generative Fill"));
+    assert!(!h.app.session.generator.klein_download_status().running);
+    assert!(!h.app.session.generator.download_status().running);
 }

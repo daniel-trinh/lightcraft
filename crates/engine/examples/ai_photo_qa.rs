@@ -48,6 +48,8 @@ mod qa {
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Case {
         source: PathBuf,
+        #[serde(default = "default_backend")]
+        backend: String,
         model_dir: Option<PathBuf>,
         removal_model: Option<PathBuf>,
         output_dir: PathBuf,
@@ -59,6 +61,10 @@ mod qa {
         preview_only: bool,
         #[serde(default)]
         params: Params,
+    }
+
+    fn default_backend() -> String {
+        "native".into()
     }
 
     #[derive(Default, Deserialize)]
@@ -87,6 +93,10 @@ mod qa {
         if !matches!(case.command.as_str(), "photo.generativeFill" | "photo.generativeRemove") {
             return Err("command must be photo.generativeFill or photo.generativeRemove".into());
         }
+        if !matches!(case.backend.as_str(), "native" | "klein") {
+            return Err("backend must be native or klein".into());
+        }
+        let klein = case.backend == "klein";
         let mask = case.mask.as_object().ok_or("mask must be an object of mask.add parameters")?;
         let kind = mask.get("kind").and_then(Value::as_str).ok_or("mask.kind is required")?;
         if !matches!(kind, "radial" | "linear" | "brush") || mask.contains_key("seg") {
@@ -127,7 +137,11 @@ mod qa {
             return Err(format!("source is not a regular file: {}", source.display()));
         }
         let mut session = Session::new().with_fs();
-        if case.command == "photo.generativeRemove" {
+        if klein {
+            let path = case.model_dir.as_deref().ok_or("Klein QA requires modelDir")?;
+            session.generator.klein_dir = Some(fs::canonicalize(path).map_err(|e| format!("modelDir {}: {e}", path.display()))?);
+            session.generator.klein_model_dir().map_err(|e| format!("Klein model is unavailable: {e}"))?;
+        } else if case.command == "photo.generativeRemove" {
             if let Some(path) = &case.removal_model {
                 session.generator.removal = Some(fs::canonicalize(path).map_err(|e| format!("removalModel {}: {e}", path.display()))?);
             }
@@ -165,14 +179,14 @@ mod qa {
 
         let mut params = json!({
             "maskId": mask_id,
-            "backend": "native",
+            "backend": case.backend,
             "prompt": case.params.prompt.unwrap_or_default(),
             "negative": case.params.negative.unwrap_or_default(),
-            "steps": case.params.steps.unwrap_or(24),
-            "guidance": case.params.guidance.unwrap_or(7.5),
+            "steps": case.params.steps.unwrap_or(if klein { 4 } else { 24 }),
+            "guidance": case.params.guidance.unwrap_or(if klein { 1.0 } else { 7.5 }),
             "seed": case.params.seed.unwrap_or(42),
-            "edge": case.params.edge.unwrap_or(512),
-            "denoise": case.params.denoise.unwrap_or(0.99),
+            "edge": case.params.edge.unwrap_or(if klein { 1024 } else { 512 }),
+            "denoise": case.params.denoise.unwrap_or(if klein { 1.0 } else { 0.99 }),
         });
         if let Some(margin) = case.params.mask_margin {
             params["maskMargin"] = json!(margin);

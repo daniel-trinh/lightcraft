@@ -141,6 +141,8 @@ pub struct AppSettings {
     pub sam1_model_file: String,
     /// Backend for newly created click-based Object masks. Semantic presets use SAM 3.
     pub object_mask_model: lightcraft_develop::ObjectModel,
+    /// Use the app-managed Klein image editor for Fill and Remove when the build supports it.
+    pub generative_use_klein: bool,
     pub startup_view: StartupView,
     /// Ask before moving photos to Recently Deleted (keyboard and menu).
     pub confirm_delete: bool,
@@ -167,6 +169,16 @@ impl Default for AppSettings {
             sam_model_dir: String::new(),
             sam1_model_file: String::new(),
             object_mask_model: lightcraft_develop::ObjectModel::Sam3,
+            generative_use_klein: {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    lightcraft_engine::generative_model::Generator::KLEIN_AVAILABLE
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    false
+                }
+            },
             startup_view: StartupView::Last,
             confirm_delete: false,
             gpu: true,
@@ -190,6 +202,16 @@ mod app_settings_tests {
         assert!(settings.sam_model_dir.is_empty());
         assert!(settings.sam1_model_file.is_empty());
         assert_eq!(settings.object_mask_model, lightcraft_develop::ObjectModel::Sam3);
+        assert_eq!(settings.generative_use_klein, lightcraft_engine::generative_model::Generator::KLEIN_AVAILABLE);
+    }
+
+    #[test]
+    fn generative_backend_preference_round_trips() {
+        let mut settings = AppSettings::default();
+        settings.generative_use_klein = !settings.generative_use_klein;
+        let encoded = serde_json::to_string(&settings).expect("serialize app settings");
+        let decoded: AppSettings = serde_json::from_str(&encoded).expect("deserialize app settings");
+        assert_eq!(decoded.generative_use_klein, settings.generative_use_klein);
     }
 }
 

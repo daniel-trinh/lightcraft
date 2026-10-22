@@ -5,7 +5,10 @@ creates a portable folder plus ZIP. The target computer does not need Python, Co
 toolkit, or a separately launched service. The CUDA runtime DLLs are shipped beside
 `lightcraft.exe`; this is a portable folder, not a physically single-file executable. Users
 launch `lightcraft.exe` from the extracted folder. The MIT-licensed MI-GAN removal model is
-included under `models/`; the larger prompt-based Fill model is downloaded by the app when requested.
+included under `models/`; the legacy SD 1.5 Fill model is downloaded by the app when requested.
+The CUDA app also supports native FLUX.2 Klein 4B Fill and Remove. Its pinned Apache-2.0
+public model is approximately 16 GB and is either downloaded with explicit licence
+acknowledgement in the app or bundled with the optional `-KleinModelDir` argument.
 The optional `-Sam1Model` argument also bundles the ungated click-selection checkpoint and
 its Apache-2.0 licence. Describe and semantic presets continue to use separately obtained SAM 3.
 
@@ -49,6 +52,7 @@ pwsh packaging/windows/package-cuda.ps1 `
   -CudaRoot 'C:\src\cuda-sdk' `
   -MiganModel 'C:\src\models\migan-f32.safetensors' `
   -Sam1Model 'C:\src\models\sam_vit_b_01ec64.safetensors' `
+  -KleinModelDir 'C:\src\models\flux2-klein-4b' `
   -OutDir 'C:\releases\lightcraft-cuda-1.0.0'
 ```
 
@@ -59,6 +63,13 @@ delete or replace an existing destination. The output contains `LightCraft-CUDA-
 
 Pass `-MiganModel` with the pinned, converted removal checkpoint described in
 [migan-model.md](migan-model.md). Packaging verifies its exact size and SHA-256 before copying
-it and its code/weight licences. The larger Fill checkpoint remains a separate app-managed download.
+it and its code/weight licences. The legacy SD 1.5 Fill checkpoint remains a separate app-managed download.
 `-Sam1Model` is optional; when provided, it must match the size and SHA-256 in
 [sam1-model.md](sam1-model.md). A mismatched file stops packaging before a release is built.
+`-KleinModelDir` is also optional. It verifies five model/tokenizer files and the licence against the pinned
+revision's sizes and SHA-256 hashes before staging them under
+`models/flux2-klein-4b/`, with the model's Apache-2.0 licence under
+`models/licenses/`. The archive writer supports files larger than 2 GB and ZIP64.
+Omit the argument to keep the smaller package and use app-managed Klein setup.
+Release artifacts include their own manifest and runtime validation reports; the earlier
+MI-GAN/SAM 1 portable checks alone do not establish Klein runtime behavior.

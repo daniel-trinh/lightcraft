@@ -10,9 +10,9 @@ Run `cargo test -p lightcraft-inpaint` for bounded loading, tokenization, condit
 
 Desktop setup and limitations: [Local Generative Fill and Remove](../../docs/generative-fill.md).
 
-The experimental `klein_tokenizer`, `klein_text`, `klein_transformer` and `klein_vae` modules are native building
-blocks for FLUX.2 Klein 4B. They are not connected to the desktop Fill/Remove
-commands yet. They read the pinned public Diffusers BF16 weights through bounded
+The `klein_tokenizer`, `klein_text`, `klein_transformer` and `klein_vae` modules are native building
+blocks for FLUX.2 Klein 4B, connected to desktop Fill/Remove through `klein::generate`.
+They read the pinned public Diffusers BF16 weights through bounded
 positional loaders (including two text-encoder shards); no Python or service is
 used by these Rust modules. The text encoder captures Qwen3 layers 9/18/27 and
 omits unused language-model layers. Transformer attention uses bounded query
@@ -31,18 +31,17 @@ case/whitespace preservation, Qwen BPE and right padding. The F32 VAE was compar
 with Diffusers at 128 and 1024 pixels on CUDA. It rejects CPU inputs above 64 pixels:
 the Candle CPU convolution path diverges at larger sizes. This restriction is
 explicit; the intended Klein product path is CUDA. `klein_vae_parity` reproduces
-the component comparison from local checkpoint and fixture files. No full Klein
-desktop integration is provided yet. `klein_download` supplies
+the component comparison from local checkpoint and fixture files. `klein_download` supplies
 the managed-installation primitives: six required runtime files (15.98 GB) pinned
 by size and SHA-256, with resume, progress and cancellation through
-`lightcraft-fetch`. It is not connected to desktop model setup yet. No gated
+`lightcraft-fetch` and the desktop setup commands. No gated
 Hugging Face account or token is required for these Apache-2.0 model files.
 
 `klein_sampling` implements the shifted Euler schedule, latent packing, position
 IDs, bilinear mask reduction and inpaint preservation blend. Captured reference
 tests matched the schedule/IDs/masks and BF16 step intermediates exactly. Keeping
 the reference dtype order matters: BF16 products round before the later F32
-addition in the Euler update. These helpers are not yet a desktop generation job.
+addition in the Euler update. The native generation job uses these helpers.
 
 `klein::generate` assembles the native CUDA pipeline with separate model phases:
 Qwen features, F32 VAE encoding, BF16 transformer denoising and F32 VAE decoding.
@@ -59,4 +58,4 @@ conditioning mode instead encodes a separate white-erased selection as reference
 tokens while retaining clean source latents for preservation; generic white-area
 instructions removed both objects in the probes. Original-mask-zero pixels were
 byte-identical in the test composites. These two photos do not establish broad
-removal accuracy, and desktop command, undo, setup and packaging checks remain.
+removal accuracy. Production-command, normal desktop button, undo, cancellation and setup verification checks also passed; release package evidence is recorded with the portable artifacts.

@@ -12,13 +12,32 @@ use crate::{
 
 fn options_for(p: &Value, remove: bool) -> Result<Options> {
     let c = if remove { "photo.generativeRemove" } else { "photo.generativeFill" };
-    let backend = match p.get("backend").and_then(Value::as_str) {
-        Some("native") => Backend::Native,
-        Some("comfy") => Backend::Comfy,
-        Some(value) => return Err(bad(c, format!("unknown backend '{value}'; choose native or comfy"))),
+    let backend = match p.get("backend") {
+        Some(Value::String(value)) if value == "native" => Backend::Native,
+        Some(Value::String(value)) if value == "klein" => Backend::Klein,
+        Some(Value::String(value)) if value == "comfy" => Backend::Comfy,
+        Some(Value::String(value)) => return Err(bad(c, format!("unknown backend '{value}'; choose native, klein or comfy"))),
+        Some(_) => return Err(bad(c, "backend must be native, klein or comfy")),
         None if p.get("endpoint").is_some() || p.get("checkpoint").is_some() => Backend::Comfy,
         None => Backend::Native,
     };
+    if backend == Backend::Klein {
+        for (key, valid) in [
+            ("steps", p.get("steps").is_none_or(|value| value.as_u64().and_then(|n| u32::try_from(n).ok()).is_some())),
+            ("guidance", p.get("guidance").is_none_or(Value::is_number)),
+            ("denoise", p.get("denoise").is_none_or(Value::is_number)),
+            ("edge", p.get("edge").is_none_or(|value| value.as_u64().and_then(|n| usize::try_from(n).ok()).is_some())),
+            ("seed", p.get("seed").is_none_or(Value::is_u64)),
+            ("negative", p.get("negative").is_none_or(Value::is_string)),
+        ] {
+            if !valid {
+                return Err(bad(c, format!("Klein {key} has an invalid value")));
+            }
+        }
+        if p.get("endpoint").is_some() || p.get("checkpoint").is_some() {
+            return Err(bad(c, "Klein is app-managed and does not use endpoint or checkpoint"));
+        }
+    }
     let mask_margin = match p.get("maskMargin") {
         Some(value) => value.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad(c, "maskMargin must be an integer from 0 to 64"))?,
         None if remove && backend == Backend::Native => REMOVE_MASK_MARGIN,
@@ -31,8 +50,8 @@ fn options_for(p: &Value, remove: bool) -> Result<Options> {
         checkpoint: p.get("checkpoint").and_then(Value::as_str).unwrap_or_default().to_string(),
         prompt: p.get("prompt").and_then(Value::as_str).unwrap_or_default().to_string(),
         negative: p.get("negative").and_then(Value::as_str).unwrap_or_default().to_string(),
-        steps: p.get("steps").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(24),
-        guidance: p.get("guidance").and_then(Value::as_f64).unwrap_or(7.5),
+        steps: p.get("steps").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(if backend == Backend::Klein { 4 } else { 24 }),
+        guidance: p.get("guidance").and_then(Value::as_f64).unwrap_or(if backend == Backend::Klein { 1.0 } else { 7.5 }),
         denoise: p.get("denoise").and_then(Value::as_f64).unwrap_or(if backend == Backend::Native { 0.99 } else { 1.0 }),
         seed: p
             .get("seed")
@@ -40,6 +59,7 @@ fn options_for(p: &Value, remove: bool) -> Result<Options> {
             .unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64),
         edge: p.get("edge").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).unwrap_or(match backend {
             Backend::Native => 512,
+            Backend::Klein => 1024,
             Backend::Comfy => 1024,
         }),
         mask_margin,
@@ -118,7 +138,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Generative Fill",
             [],
             None,
-            "{maskId, prompt: replacement description (required; use photo.generativeRemove for removal), backend?: native|comfy (native default), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512 (native model patch size; output stays full resolution), denoise?: 0.99 native|1 comfy, maskMargin?: 0..64 (native default 0), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — generate selected mask as a new PNG and library photo; original is retained → {id, path, original}",
+            "{maskId, prompt: replacement description (required), backend?: native|klein|comfy (native default), negative?, steps?: 24 native|4 klein, guidance?: 7.5 native|1 klein, seed?, edge?: 512 native|1024 klein, denoise?: 0.99 native|1 klein, maskMargin?: 0..64, endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — generate selected mask as a new PNG and library photo; original is retained → {id, path, original}",
             has_active,
             fill
         ),
@@ -127,7 +147,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Generative Remove",
             [],
             None,
-            "{maskId, backend?: native|comfy (native default), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512 (native model patch size; output stays full resolution), denoise?: 0.99 native|1 comfy, maskMargin?: 0..64 (native default 0), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — remove the selected area with bundled MI-GAN (native) or background prompts (ComfyUI); native ignores diffusion settings, saving a separate PNG and library photo → {id, path, original}",
+            "{maskId, backend?: native|klein|comfy (native default), steps?: 4 klein, guidance?: 1 klein, seed?, edge?: 1024 klein, denoise?: 1 klein, maskMargin?: 0..64, endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — remove the selected area with bundled MI-GAN (native), prompt-guided Klein, or ComfyUI; saves a separate PNG and library photo → {id, path, original}",
             has_active,
             remove
         ),
@@ -166,6 +186,63 @@ mod tests {
         assert!(options_for(&json!({"maskMargin":65}), false).is_err());
         assert!(options_for(&json!({"maskMargin":-1}), false).is_err());
         assert!(options_for(&json!({"backend":"comfy","checkpoint":"inpaint.safetensors","maskMargin":1}), false).is_err());
+    }
+
+    #[test]
+    fn klein_options_are_explicit_and_reject_unsupported_controls() {
+        let opts = options_for(&json!({"backend":"klein","prompt":"orange cloth"}), false).unwrap();
+        assert_eq!(opts.backend, Backend::Klein);
+        assert_eq!((opts.steps, opts.guidance, opts.denoise, opts.edge), (4, 1.0, 1.0, 1024));
+        assert_eq!(opts.mask_margin, 0);
+        for (name, value) in [
+            ("steps", json!(5)),
+            ("steps", json!(u64::MAX)),
+            ("guidance", json!(7.5)),
+            ("denoise", json!(0.5)),
+            ("negative", json!("objects")),
+            ("edge", json!(1000)),
+            ("edge", json!(2048)),
+        ] {
+            let mut p = json!({"backend":"klein","prompt":"orange cloth"});
+            p[name] = value;
+            assert!(options_for(&p, false).is_err(), "{name} should be rejected");
+        }
+        let remove = options_for(&json!({"backend":"klein","prompt":"old fill description"}), true).unwrap();
+        assert_eq!(remove.operation, Operation::Remove);
+    }
+
+    #[test]
+    fn non_string_backend_is_rejected_before_legacy_fallback() {
+        for value in [Value::Null, json!(true), json!(123), json!([]), json!({})] {
+            for endpoint in [false, true] {
+                let mut request = json!({"backend": value.clone(), "prompt": "orange cloth"});
+                if endpoint {
+                    request["endpoint"] = json!("http://127.0.0.1:8188");
+                    request["checkpoint"] = json!("local.safetensors");
+                }
+                let error = options_for(&request, false).unwrap_err().to_string();
+                assert!(error.contains("backend must"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn klein_missing_model_does_not_import_or_change_source() {
+        let mut s = Session::with_demo();
+        let source = s.active().unwrap();
+        s.execute("mask.add", &json!({"kind": "radial"})).unwrap();
+        let source_before = s.catalog.photo(source).unwrap().clone();
+        let count = s.catalog.photos().count();
+        let undo = s.undo.len();
+        s.generator.klein_dir = Some(std::env::temp_dir().join(format!("lc-klein-absent-{}", std::process::id())));
+        let output = std::env::temp_dir().join(format!("lc-klein-no-output-{}", std::process::id()));
+        let result =
+            s.execute("photo.generativeFill", &json!({"backend":"klein","maskId":s.active_mask.unwrap(),"prompt":"orange cloth","dir":output}));
+        assert!(result.is_err());
+        assert_eq!(s.catalog.photos().count(), count);
+        assert_eq!(s.undo.len(), undo);
+        assert_eq!(s.catalog.photo(source).unwrap().source, source_before.source);
+        assert_eq!(s.catalog.photo(source).unwrap().develop, source_before.develop);
     }
 
     #[test]

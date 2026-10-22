@@ -348,6 +348,208 @@ fn remove(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
+    if lightcraft_engine::generative_model::Generator::KLEIN_AVAILABLE {
+        if app.ui.settings.generative_use_klein {
+            generative_klein_panel(app, ui, id);
+            return;
+        }
+        padded(ui, |ui| {
+            let r = ui.button("Use Klein editor");
+            register(ui.ctx(), "button:generativeCompatibility", r.rect);
+            if r.clicked() {
+                app.ui.settings.generative_use_klein = true;
+            }
+        });
+    }
+    generative_legacy_panel(app, ui, id);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn generative_klein_panel(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
+    const LABEL: &str = "Generative Fill";
+    divider(ui);
+    header(ui, "Generative Fill and Remove");
+    padded(ui, |ui| {
+        ui.label("Select a mask in Masking. Fill replaces it using your prompt; Remove reconstructs its background. Each result is a new photo.");
+        ui.label("Runs locally on your NVIDIA GPU. Edits retain the cropped photo's resolution.");
+        ui.label("For removal, include the whole object and its shadow in the mask.");
+        ui.horizontal(|ui| {
+            ui.label("AI editor");
+            let r = ui.button("Compatibility options…");
+            register(ui.ctx(), "button:generativeCompatibility", r.rect);
+            if r.clicked() {
+                app.ui.settings.generative_use_klein = false;
+            }
+        });
+
+        let installed = app.session.generator.klein_installed();
+        let download = app.session.generator.klein_download_status();
+        let running = app.tasks.is_running(LABEL);
+        let bytes = lightcraft_engine::generative_model::KLEIN_MODEL_BYTES;
+        ui.label(format!("One-time setup: {} of model files", format_bytes(bytes)));
+        ui.hyperlink_to(lightcraft_engine::generative_model::KLEIN_LICENSE_NAME, lightcraft_engine::generative_model::KLEIN_LICENSE_URL);
+        let setup =
+            ui.add_enabled(!download.running && !running, egui::Button::new(if installed { "Verify / repair model" } else { "Download model" }));
+        register(ui.ctx(), "button:generativeDownloadModel", setup.rect);
+        if setup.clicked()
+            && let Err(e) = app.run("generative.model.download", json!({"model": "klein", "acknowledged": true}))
+        {
+            app.toast_error(ui.ctx(), e);
+        }
+        if download.running {
+            let ratio = if download.total > 0 { (download.done as f64 / download.total as f64).clamp(0.0, 1.0) as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(ratio).text(format!(
+                "Setting up: {} of {} ({:.0}%)",
+                format_bytes(download.done),
+                format_bytes(download.total),
+                ratio * 100.0
+            )));
+            let r = ui.button("Cancel setup");
+            register(ui.ctx(), "button:generativeCancelDownload", r.rect);
+            if r.clicked() {
+                let _ = app.run("generative.model.cancel", json!({"model": "klein"}));
+            }
+        }
+        if let Some(error) = &download.error {
+            ui.label(format!("Model setup: {error}"));
+        }
+        ui.label("Replacement description (required for Fill)");
+        let r = ui.text_edit_singleline(&mut app.ui.generative_prompt);
+        register(ui.ctx(), "field:generativePrompt", r.rect);
+        if app.session.catalog.photo(id).is_some_and(|p| matches!(&p.source, lightcraft_catalog::Source::Demo { .. })) {
+            ui.label("Output folder for demo photo");
+            let r = ui.text_edit_singleline(&mut app.ui.generative_demo_dir);
+            register(ui.ctx(), "field:generativeDemoDir", r.rect);
+        }
+        let selected = app.session.active_mask;
+        ui.label(match selected {
+            Some(n) => format!("Selected mask: {n}"),
+            None => "Select a mask first".into(),
+        });
+        let (fill_clicked, remove_clicked) = ui
+            .horizontal(|ui| {
+                let fill = ui.add_enabled(
+                    installed && selected.is_some() && !running && !download.running && !app.ui.generative_prompt.trim().is_empty(),
+                    egui::Button::new("Fill"),
+                );
+                register(ui.ctx(), "button:generativeFill", fill.rect);
+                let remove = ui.add_enabled(installed && selected.is_some() && !running && !download.running, egui::Button::new("Remove"));
+                register(ui.ctx(), "button:generativeRemove", remove.rect);
+                (fill.clicked(), remove.clicked())
+            })
+            .inner;
+        if running {
+            let (step, total) = app.session.generator.generation_progress();
+            let phase = app.session.generator.generation_phase();
+            if total > 1 {
+                ui.add(egui::ProgressBar::new(step as f32 / total as f32).text(format!("{phase}: step {step} of {total}")));
+            } else {
+                ui.label(format!("{phase}…"));
+            }
+            let r = ui.button("Cancel generation");
+            register(ui.ctx(), "button:generativeCancel", r.rect);
+            if r.clicked() {
+                let _ = app.run("photo.generativeCancel", json!({}));
+            }
+        }
+        if fill_clicked || remove_clicked {
+            let Some(mask) = selected else { return };
+            let prompt = if remove_clicked {
+                "empty natural background, matching the surrounding texture, lighting and perspective".to_string()
+            } else {
+                app.ui.generative_prompt.clone()
+            };
+            let opts = lightcraft_engine::generative::Options {
+                operation: if remove_clicked {
+                    lightcraft_engine::generative::Operation::Remove
+                } else {
+                    lightcraft_engine::generative::Operation::Fill
+                },
+                backend: lightcraft_engine::generative::Backend::Klein,
+                endpoint: String::new(),
+                checkpoint: String::new(),
+                prompt,
+                negative: String::new(),
+                steps: 4,
+                guidance: 1.0,
+                denoise: 1.0,
+                seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                edge: 1024,
+                mask_margin: 0,
+            };
+            let demo_dir = (!app.ui.generative_demo_dir.trim().is_empty()).then(|| app.ui.generative_demo_dir.clone());
+            start_generative_job(app, ui, id, mask, opts, demo_dir.as_deref(), true);
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn format_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB { format!("{:.1} GB", bytes as f64 / GIB as f64) } else { format!("{:.0} MB", bytes as f64 / (1024 * 1024) as f64) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn start_generative_job(
+    app: &mut LightcraftApp,
+    ui: &mut egui::Ui,
+    id: PhotoId,
+    mask: u32,
+    opts: lightcraft_engine::generative::Options,
+    demo_dir: Option<&str>,
+    klein: bool,
+) {
+    const LABEL: &str = "Generative Fill";
+    match app.session.plan_generative(id, mask, opts, demo_dir) {
+        Ok(job) => {
+            let signals = app.session.generator.generation_signals();
+            let source_photo = app.session.catalog.photo(id).cloned();
+            let source_library = app.session.library.as_ref().map(|l| (l.dir.clone(), l.on_disk));
+            if let Err(e) = crate::tasks::spawn(
+                app,
+                LABEL,
+                move || {
+                    if klein {
+                        job.run_with_phases(
+                            &signals.cancel,
+                            |step, total| signals.progress.update(step, total),
+                            |phase| signals.progress.set_phase(phase),
+                        )
+                    } else {
+                        job.run_with(&signals.cancel, |step, total| signals.progress.update(step, total))
+                    }
+                },
+                move |app, ctx, result| match result {
+                    Ok(path)
+                        if source_photo.as_ref().is_none_or(|source| {
+                            app.session.library.as_ref().map(|l| (l.dir.clone(), l.on_disk)) != source_library
+                                || !app.session.catalog.photo(id).is_some_and(|current| std::sync::Arc::ptr_eq(current, source))
+                        }) =>
+                    {
+                        app.toast_error(
+                            ctx,
+                            format!(
+                                "The source photo or library changed while generating. The result is saved at {} and can be imported manually.",
+                                path.display()
+                            ),
+                        )
+                    }
+                    Ok(path) => match app.run("photo.generativeImport", json!({"original": id.0, "path": path.to_string_lossy()})) {
+                        Ok(_) => app.toast(ctx, "Generated photo added to the library"),
+                        Err(e) => app.toast_error(ctx, e),
+                    },
+                    Err(e) => app.toast_error(ctx, e),
+                },
+            ) {
+                app.toast_error(ui.ctx(), e);
+            }
+        }
+        Err(e) => app.toast_error(ui.ctx(), e),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn generative_legacy_panel(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
     const LABEL: &str = "Generative Fill";
     divider(ui);
     header(ui, "Generative Fill and Remove");
@@ -468,35 +670,8 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
                 edge: 512,
                 mask_margin: if remove_clicked { lightcraft_engine::generative::REMOVE_MASK_MARGIN } else { 0 },
             };
-            let demo_dir = (!app.ui.generative_demo_dir.trim().is_empty()).then_some(app.ui.generative_demo_dir.as_str());
-            match app.session.plan_generative(id, mask, opts, demo_dir) {
-                Ok(job) => {
-                    let signals = app.session.generator.generation_signals();
-                    let source_photo = app.session.catalog.photo(id).cloned();
-                    let source_library = app.session.library.as_ref().map(|l| (l.dir.clone(), l.on_disk));
-                    if let Err(e) = crate::tasks::spawn(
-                        app,
-                        LABEL,
-                        move || job.run_with(&signals.cancel, |step, total| signals.progress.update(step, total)),
-                        move |app, ctx, result| {
-                            match result {
-                            Ok(path) if source_photo.as_ref().is_none_or(|source| {
-                                app.session.library.as_ref().map(|l| (l.dir.clone(), l.on_disk)) != source_library
-                                    || !app.session.catalog.photo(id).is_some_and(|current| std::sync::Arc::ptr_eq(current, source))
-                            }) => app.toast_error(ctx, format!("The source photo or library changed while generating. The result is saved at {} and can be imported manually.", path.display())),
-                            Ok(path) => match app.run("photo.generativeImport", json!({"original": id.0, "path": path.to_string_lossy()})) {
-                                Ok(_) => app.toast(ctx, "Generated photo added to the library"),
-                                Err(e) => app.toast_error(ctx, e),
-                            },
-                            Err(e) => app.toast_error(ctx, e),
-                        }
-                        },
-                    ) {
-                        app.toast_error(ui.ctx(), e);
-                    }
-                }
-                Err(e) => app.toast_error(ui.ctx(), e),
-            }
+            let demo_dir = (!app.ui.generative_demo_dir.trim().is_empty()).then(|| app.ui.generative_demo_dir.clone());
+            start_generative_job(app, ui, id, mask, opts, demo_dir.as_deref(), false);
         }
     });
 }

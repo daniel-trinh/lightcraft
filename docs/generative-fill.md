@@ -1,28 +1,26 @@
 # Local Generative Fill and Remove
 
-Native FLUX.2 Klein 4B integration is in development. Its tokenizer, text features,
-transformer, VAE and sampling helpers have reference checks, including CUDA
-transformer/VAE checks at a 1024-pixel canvas. Managed-download primitives pin
-15.98 GB of Apache-2.0 model files. These components are not connected to desktop
-Fill/Remove yet, so the workflow and quality limits below still describe the
-current app. Component agreement does not establish complete native generation
-quality. A native CUDA orchestration API and developer image probe now also run
-complete images: the NASA badge and coffee spoon were removed with explicit
-erased-mask conditioning, and prompt Fill produced a blue fabric patch. These
-are developer probes; desktop wiring and release validation remain unfinished.
-See the [inpaint crate notes](../crates/inpaint/README.md).
+The NVIDIA CUDA build adds native FLUX.2 Klein 4B for prompt-guided Fill and Remove. It runs inside LightCraft through Candle without Python, ComfyUI, a separate service or a cloud photo upload. Klein needs an NVIDIA CUDA GPU; there is no CPU fallback. The earlier MI-GAN Remove and SD 1.5 Fill remain available as legacy native paths, including CPU builds.
 
-This fork runs MI-GAN removal and SD 1.5 prompt-based Fill inside Lightcraft through Candle. Portable CUDA packages include the small MIT-licensed removal model; Fill offers a separate one-time download. No ComfyUI, Python runtime, separate server, or cloud image upload is required for the desktop workflow. Optional NVIDIA builds use CUDA kernels and bundled runtime libraries; CPU builds use Rust inference.
+## Klein setup and behavior
 
-## Desktop setup
+Klein uses the public Apache-2.0 [FLUX.2-klein-4B checkpoint](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) pinned to revision `e7b7dc27f91deacad38e78976d1f2b499d76a294`. Its five model/tokenizer files plus licence total 15,975,644,852 bytes (about 16 GB). The app-managed setup requires explicit model-licence acknowledgement, supports cancellation and resuming, and checks the pinned size and SHA-256 of every file, including same-sized corrupt files during repair. A CUDA portable package may instead include the same checked files under `models/flux2-klein-4b/` with `-KleinModelDir`; see [Windows CUDA packaging](cuda-windows.md). `LIGHTCRAFT_KLEIN_DIR` can name an existing model folder.
+
+Choose a mask, then **Fill** with a description of the desired replacement or **Remove** to continue the surrounding background. Klein Remove uses a fixed generic background-continuation prompt and a white erased-mask condition; Fill uses the supplied prompt and full source image. Both use four diffusion steps. Klein processes an aligned, aspect-preserving context patch no larger than 1024 × 1024; the engine blends its output through the original soft mask into the full-resolution render (up to 64 MP), leaving unselected pixels unchanged. The result is a separate flattened 8-bit PNG and library photo; the source and develop settings remain intact. Undo removes the generated catalog entry while retaining the PNG on disk for recovery.
+
+The native model components have passed focused checkpoint and 1024-pixel CUDA parity checks. NASA badge and coffee-spoon examples were inspected with specific and generic Remove prompts, and a Fill example was inspected. Those are limited real-photo checks, not a guarantee across masks, subjects or cameras. Production-command checks also covered a 6000 × 4000 output, unchanged unselected pixels and undo. Normal desktop Fill and Remove button checks preserved source files/settings and imported separate results; one-step undo retained both PNGs. These checks establish editing behavior on these fixtures, not general model accuracy.
+
+The commands accept `backend:"klein"` on `photo.generativeFill` and `photo.generativeRemove`; Klein setup uses `generative.model.download {"model":"klein","acknowledged":true}` and `generative.model.cancel {"model":"klein"}`. The `generative.model.status` response reports Klein availability and installation separately. Web builds do not run Klein inference. The older local options below use `backend:"native"` (the legacy command default).
+
+## Legacy native setup
 
 1. Create or select a mask in **Masking**, then open **Remove**.
-2. **Remove** is ready when the portable package's `models` folder is present. Select the whole distraction, including its shadow, and choose Remove. No Fill model download is needed for removal.
-3. For **Fill**, read the CreativeML OpenRAIL-M model licence, check the consent box, and click **Download model**. The pinned checkpoint and tokenizer files total 2.13 GB. Downloading does not start until you click the button; checking consent alone does nothing. Consent is not stored in saved UI settings.
+2. Select the legacy native/MI-GAN option for **Remove**. It is ready when the portable package's `models` folder is present. Select the whole distraction, including its shadow. No Fill model download is needed for this removal path.
+3. For legacy SD 1.5 **Fill**, read the CreativeML OpenRAIL-M model licence, check the consent box, and click **Download model**. The pinned checkpoint and tokenizer files total 2.13 GB. Downloading does not start until you click the button; checking consent alone does nothing. Consent is not stored in saved UI settings.
 4. The app shows download progress and supports cancellation and resuming partial files. Each file is checked against its pinned size and SHA-256 before installation.
-5. Enter a replacement description and click **Fill**. Fill requires nonblank text; use **Remove** to reconstruct the background without a replacement description. For procedural demo photos, enter an output folder too.
+5. Enter a replacement prompt and click **Fill**. For procedural demo photos, enter an output folder too.
 
-Generation runs on a background thread, with progress and cancellation between steps. The optional `cuda` build selects an NVIDIA GPU and reports initialization failures instead of silently falling back to CPU. Other Windows/Linux builds use CPU; macOS uses Metal when available, otherwise CPU. The panel and `generative.model.status` show the configured inference backend. Preparing/loading the model cannot currently be interrupted midway; a cancellation request is honored when that stage finishes. The model is released when the job finishes. See [Windows CUDA packaging](cuda-windows.md) for the portable runtime layout and GPU target.
+Legacy native generation runs on a background thread, with progress and cancellation between steps. The optional `cuda` build selects an NVIDIA GPU and reports initialization failures instead of silently falling back to CPU. Other Windows/Linux builds use CPU; macOS uses Metal when available, otherwise CPU. The panel and `generative.model.status` show the configured inference backend. Preparing/loading the model cannot currently be interrupted midway; a cancellation request is honored when that stage finishes. The model is released when the job finishes. See [Windows CUDA packaging](cuda-windows.md) for the portable runtime layout and GPU target.
 
 A result is a separate 8-bit sRGB PNG and library photo, stacked with the source. The source file and develop settings remain intact. Undo removes the generated catalog entry; the PNG remains recoverable on disk. Native output retains the cropped, oriented photo's dimensions, up to 64 megapixels. The model processes a context patch around the mask at up to 512 pixels, then the engine blends it back into the full-resolution render. Large selections can therefore have less detail than the source. This produces a flattened rendered copy; it does not preserve raw or HDR pixel data in the generated PNG.
 
@@ -71,7 +69,7 @@ resolution/conservation workload, not evidence of native 24 MP detail or better 
 
 The developer-only `ai_photo_qa` engine example runs the production native command on an
 explicit photo. It copies that photo into the output folder before importing it; the source
-path is never an editing destination. A JSON case (at most 1 MiB) names `source`, `modelDir` (Fill) or `removalModel` (Remove),
+path is never an editing destination. A JSON case (at most 1 MiB) names `source`, optional `backend` (`native` by default or `klein`), `modelDir` (legacy Fill or both Klein operations) or `removalModel` (legacy Remove),
 `outputDir`, `command` (`photo.generativeFill` or `photo.generativeRemove`), `mask` (ordinary
 `mask.add` parameters), and optional `params` (prompt, negative, steps, guidance, seed, edge,
 denoise, maskMargin). AI masks are deliberately excluded so this test does not require gated SAM weights.

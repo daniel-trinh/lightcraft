@@ -21,6 +21,7 @@ use crate::{
 const MAX_RESPONSE: usize = 64 * 1024 * 1024;
 const MAX_EDGE: usize = 2048;
 const NATIVE_MAX_EDGE: usize = 512;
+const KLEIN_MAX_EDGE: usize = 1024;
 const MAX_NATIVE_PIXELS: usize = 64_000_000;
 pub const REMOVE_MASK_MARGIN: usize = 0;
 static NEXT_NAME: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +46,7 @@ pub struct Options {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Native,
+    Klein,
     Comfy,
 }
 
@@ -86,9 +88,20 @@ impl Options {
                     return Err("native inpainting supports image edges from 64 to 512 pixels".into());
                 }
             }
+            Backend::Klein => {
+                if self.steps != 4 || self.guidance != 1.0 || self.denoise != 1.0 {
+                    return Err("Klein uses exactly 4 steps, guidance 1, and denoise 1".into());
+                }
+                if !self.negative.trim().is_empty() {
+                    return Err("Klein does not support a negative prompt".into());
+                }
+                if !(64..=KLEIN_MAX_EDGE).contains(&self.edge) || !self.edge.is_multiple_of(16) {
+                    return Err("Klein image edge must be 64..1024 and divisible by 16".into());
+                }
+            }
             Backend::Comfy => {
                 if self.mask_margin != 0 {
-                    return Err("maskMargin is only available with backend=native".into());
+                    return Err("maskMargin is only available with local backends".into());
                 }
                 endpoint(&self.endpoint)?;
                 if self.checkpoint.trim().is_empty() || self.checkpoint.chars().any(char::is_control) {
@@ -112,6 +125,14 @@ pub fn removal_prompts(negative: &str) -> (String, String) {
     let avoid = "subject, object, person, text, artifact";
     let negative = if negative.trim().is_empty() { avoid.to_string() } else { format!("{avoid}, {negative}") };
     (prompt, negative)
+}
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+const KLEIN_REMOVE_PROMPT: &str = "Fill the white masked area with a seamless continuation of the surrounding background. Match the surrounding colors, textures, lighting and perspective. Do not add new objects, symbols or text. Keep the rest of the photograph unchanged.";
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn klein_prompt(options: &Options) -> String {
+    if options.operation == Operation::Remove { KLEIN_REMOVE_PROMPT.into() } else { options.prompt.clone() }
 }
 
 /// Detached work suitable for a UI background task.
@@ -152,8 +173,18 @@ impl Session {
                 }
             }
             Backend::Comfy => None,
+            Backend::Klein => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    Some(self.generator.klein_model_dir()?)
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    return Err("Klein inpainting is only available in the desktop app".into());
+                }
+            }
         };
-        let render_edge = if options.backend == Backend::Native {
+        let render_edge = if options.backend != Backend::Comfy {
             if u64::from(photo.width).saturating_mul(u64::from(photo.height)) > MAX_NATIVE_PIXELS as u64 {
                 return Err("the source exceeds the 64 MP safety limit; export a smaller copy first".into());
             }
@@ -178,7 +209,7 @@ impl Session {
             opacity: 100,
         });
         // A tight crop may have a short output edge while still needing native source pixels.
-        if options.backend == Backend::Native {
+        if options.backend != Backend::Comfy {
             image.level = SourceLevel::Full;
             image.source = self.media.source_ref(&photo, SourceLevel::Full);
             mask.level = SourceLevel::Full;
@@ -264,7 +295,18 @@ impl Job {
     }
 
     /// Run generation with cooperative cancellation and model progress reporting.
-    pub fn run_with(self, cancel: &std::sync::atomic::AtomicBool, mut progress: impl FnMut(usize, usize)) -> Result<PathBuf, String> {
+    pub fn run_with(self, cancel: &std::sync::atomic::AtomicBool, progress: impl FnMut(usize, usize)) -> Result<PathBuf, String> {
+        self.run_with_phases(cancel, progress, |_| {})
+    }
+
+    /// Report coarse Klein phases alongside step progress to a background UI task.
+    pub fn run_with_phases(
+        self,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut progress: impl FnMut(usize, usize),
+        mut phase: impl FnMut(&'static str),
+    ) -> Result<PathBuf, String> {
+        let _ = &mut phase;
         if cancel.load(Ordering::Relaxed) {
             return Err("generation cancelled".into());
         }
@@ -278,7 +320,7 @@ impl Job {
         if (image.width, image.height) != (mask.width, mask.height) || image.width == 0 || image.height == 0 {
             return Err("mask and photo sizes do not match".into());
         }
-        if self.options.backend == Backend::Native && image.width.saturating_mul(image.height) > MAX_NATIVE_PIXELS {
+        if self.options.backend != Backend::Comfy && image.width.saturating_mul(image.height) > MAX_NATIVE_PIXELS {
             return Err("the rendered edit exceeds the 64 MP safety limit; export a smaller copy first".into());
         }
         if !mask.data.iter().any(|px| px[0] > 8) {
@@ -371,6 +413,71 @@ impl Job {
                 {
                     let _ = self.model_dir.as_deref();
                     return Err("native inpainting is not enabled in this build".into());
+                }
+            }
+            Backend::Klein => {
+                #[cfg(all(feature = "inpaint", not(target_arch = "wasm32")))]
+                {
+                    let model_dir = self.model_dir.as_deref().ok_or("Klein model directory is unavailable")?;
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("generation cancelled".into());
+                    }
+                    let roi = selected_klein_roi(&mask, self.options.edge).ok_or("the selected mask has no visible area")?;
+                    let patch = roi_patch(&image, roi);
+                    let mut rgb = Vec::with_capacity(patch.width * patch.height * 3);
+                    for px in &patch.data {
+                        rgb.extend_from_slice(px.get(..3).ok_or("invalid rendered pixel")?);
+                    }
+                    let mut mask8 = roi_mask8(&mask, roi);
+                    dilate_mask8(&mut mask8, patch.width, patch.height, self.options.mask_margin)?;
+                    let options = lightcraft_inpaint::klein::KleinOptions {
+                        prompt: klein_prompt(&self.options),
+                        seed: self.options.seed,
+                        steps: self.options.steps as usize,
+                        strength: self.options.denoise,
+                        conditioning: if self.options.operation == Operation::Remove {
+                            lightcraft_inpaint::klein::KleinConditioning::ErasedMask
+                        } else {
+                            lightcraft_inpaint::klein::KleinConditioning::FullImage
+                        },
+                    };
+                    let pixels =
+                        lightcraft_inpaint::klein::generate(model_dir, &rgb, &mask8, patch.width, patch.height, &options, cancel, &mut |event| {
+                            use lightcraft_inpaint::klein::KleinPhase;
+                            match event.phase {
+                                KleinPhase::Text => {
+                                    phase("Text");
+                                    progress(0, 4);
+                                }
+                                KleinPhase::Encode => {
+                                    phase("Encode");
+                                    progress(0, 4);
+                                }
+                                KleinPhase::Denoise { step, total } => {
+                                    phase("Denoise");
+                                    progress(step, total);
+                                }
+                                KleinPhase::Decode => {
+                                    phase("Decode");
+                                    progress(4, 4);
+                                }
+                            }
+                        })
+                        .map_err(|e| format!("Klein generation failed: {e}"))?;
+                    if pixels.len() != patch.width.saturating_mul(patch.height).saturating_mul(3) {
+                        return Err("Klein returned an invalid image size".into());
+                    }
+                    let mut generated = Rgba8::new(patch.width, patch.height);
+                    for (dst, src) in generated.data.iter_mut().zip(pixels.as_chunks::<3>().0) {
+                        dst[..3].copy_from_slice(src);
+                        dst[3] = 255;
+                    }
+                    composite_roi(&mut image, &generated, &mask, roi);
+                }
+                #[cfg(not(all(feature = "inpaint", not(target_arch = "wasm32"))))]
+                {
+                    let _ = self.model_dir.as_deref();
+                    return Err("Klein inpainting is not enabled in this build".into());
                 }
             }
             Backend::Comfy => {
@@ -499,6 +606,41 @@ fn selected_roi(mask: &Rgba8, edge: usize) -> Option<Roi> {
 }
 
 #[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
+fn selected_klein_roi(mask: &Rgba8, edge: usize) -> Option<Roi> {
+    if mask.width == 0
+        || mask.height == 0
+        || mask.width.checked_mul(mask.height) != Some(mask.data.len())
+        || !(64..=KLEIN_MAX_EDGE).contains(&edge)
+        || !edge.is_multiple_of(16)
+    {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (mask.width, mask.height, 0, 0);
+    for (i, pixel) in mask.data.iter().enumerate() {
+        if pixel[0] > 8 {
+            let (x, y) = (i % mask.width, i / mask.width);
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    if x0 > x1 || y0 > y1 {
+        return None;
+    }
+    // Keep at least 1024 source pixels of context on each available axis. Small
+    // photos use the complete frame, and large selections get three times their box.
+    let w = (x1 - x0 + 1).saturating_mul(3).max(1024).min(mask.width);
+    let h = (y1 - y0 + 1).saturating_mul(3).max(1024).min(mask.height);
+    let x = ((x0 + x1 + 1).saturating_sub(w) / 2).min(mask.width - w);
+    let y = ((y0 + y1 + 1).saturating_sub(h) / 2).min(mask.height - h);
+    let scale = (edge as f64 / w as f64).min(edge as f64 / h as f64);
+    let active_w = ((w as f64 * scale).round() as usize).clamp(1, edge);
+    let active_h = ((h as f64 * scale).round() as usize).clamp(1, edge);
+    Some(Roi { x, y, w, h, active_w, active_h, model_w: active_w.next_multiple_of(16).max(64), model_h: active_h.next_multiple_of(16).max(64) })
+}
+
+#[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
 fn sample_bilinear(src: &Rgba8, x: f64, y: f64) -> [u8; 4] {
     let x = x.clamp(0.0, (src.width - 1) as f64);
     let y = y.clamp(0.0, (src.height - 1) as f64);
@@ -569,12 +711,7 @@ fn roi_mask8(mask: &Rgba8, roi: Roi) -> Vec<u8> {
 /// conditioning only: `composite_roi` always receives the untouched full-resolution mask.
 #[cfg(any(all(feature = "inpaint", not(target_arch = "wasm32")), test))]
 fn dilate_mask8(mask: &mut [u8], width: usize, height: usize, margin: usize) -> Result<(), String> {
-    if width == 0
-        || height == 0
-        || width > NATIVE_MAX_EDGE
-        || height > NATIVE_MAX_EDGE
-        || width.checked_mul(height) != Some(mask.len())
-        || margin > 64
+    if width == 0 || height == 0 || width > KLEIN_MAX_EDGE || height > KLEIN_MAX_EDGE || width.checked_mul(height) != Some(mask.len()) || margin > 64
     {
         return Err("invalid model mask dimensions or margin".into());
     }
@@ -930,6 +1067,58 @@ mod tests {
                 assert_eq!(after, &[250, 10, 20, 255]);
             }
         }
+    }
+
+    #[test]
+    fn klein_roi_keeps_large_context_and_preserves_unselected_pixels() {
+        let mask = Rgba8::from_fn(3000, 2000, |x, y| if (1450..1550).contains(&x) && (950..1050).contains(&y) { [255; 4] } else { [0, 0, 0, 255] });
+        let roi = selected_klein_roi(&mask, 1024).unwrap();
+        assert_eq!((roi.w, roi.h), (1024, 1024));
+        assert_eq!((roi.model_w, roi.model_h), (1024, 1024));
+        assert!(roi.x <= 1450 && roi.x + roi.w >= 1550);
+        assert!(roi.y <= 950 && roi.y + roi.h >= 1050);
+        let mut image = Rgba8::filled(3000, 2000, [20, 30, 40, 255]);
+        let replacement = Rgba8::filled(roi.model_w, roi.model_h, [220, 10, 10, 255]);
+        composite_roi(&mut image, &replacement, &mask, roi);
+        assert_eq!(image.get(0, 0), [20, 30, 40, 255]);
+        assert_eq!(image.get(1450, 950), [220, 10, 10, 255]);
+        assert_eq!(image.get(1550, 1050), [20, 30, 40, 255]);
+    }
+
+    #[test]
+    fn klein_roi_uses_complete_small_source_and_bounded_rectangular_canvas() {
+        let mask = Rgba8::from_fn(512, 320, |x, y| if (5..12).contains(&x) && (8..16).contains(&y) { [255; 4] } else { [0, 0, 0, 255] });
+        let roi = selected_klein_roi(&mask, 1024).unwrap();
+        assert_eq!((roi.x, roi.y, roi.w, roi.h), (0, 0, 512, 320));
+        assert_eq!(roi.model_w, 1024);
+        assert!(roi.model_h <= 1024 && roi.model_h >= 64 && roi.model_h.is_multiple_of(16));
+        assert!(roi_mask8(&mask, roi).contains(&255));
+        let wide = Rgba8::from_fn(8192, 256, |x, y| if x == 4096 && y == 128 { [255; 4] } else { [0, 0, 0, 255] });
+        let roi = selected_klein_roi(&wide, 1024).unwrap();
+        assert_eq!((roi.w, roi.h), (1024, 256));
+        assert_eq!(roi.model_w, 1024);
+        assert_eq!(roi.model_h, 256);
+    }
+
+    #[test]
+    fn klein_remove_prompt_ignores_previous_fill_description() {
+        let options = Options {
+            operation: Operation::Remove,
+            backend: Backend::Klein,
+            endpoint: String::new(),
+            checkpoint: String::new(),
+            prompt: "blue badge with letters".into(),
+            negative: String::new(),
+            steps: 4,
+            guidance: 1.0,
+            denoise: 1.0,
+            seed: 42,
+            edge: 1024,
+            mask_margin: 0,
+        };
+        assert_eq!(klein_prompt(&options), KLEIN_REMOVE_PROMPT);
+        let fill = Options { operation: Operation::Fill, ..options };
+        assert_eq!(klein_prompt(&fill), "blue badge with letters");
     }
 
     #[test]

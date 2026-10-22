@@ -123,6 +123,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_release_contract_matches_runtime_model_files() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use std::collections::BTreeMap;
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packaging/windows/klein-model.json")))?;
+        assert_eq!(manifest.get("revision").and_then(serde_json::Value::as_str), Some(MODEL_REVISION));
+        assert_eq!(manifest.get("license").and_then(serde_json::Value::as_str), Some(LICENSE_NAME));
+        assert_eq!(manifest.get("total_bytes").and_then(serde_json::Value::as_u64), Some(MODEL_BYTES));
+
+        let files = manifest.get("files").and_then(serde_json::Value::as_array).ok_or("release contract has no files")?;
+        let mut release = BTreeMap::new();
+        for file in files {
+            let folder = file.get("folder").and_then(serde_json::Value::as_str).ok_or("release folder missing")?;
+            let name = file.get("name").and_then(serde_json::Value::as_str).ok_or("release file name missing")?;
+            let bytes = file.get("bytes").and_then(serde_json::Value::as_u64).ok_or("release byte length missing")?;
+            let sha256 = file.get("sha256").and_then(serde_json::Value::as_str).ok_or("release SHA256 missing")?;
+            assert!(release.insert((folder.to_owned(), name.to_owned()), (bytes, sha256.to_owned())).is_none(), "duplicate release model path");
+        }
+
+        let runtime: BTreeMap<_, _> = MODEL_FILES
+            .iter()
+            .map(|entry| {
+                (
+                    (entry.folder.to_owned(), entry.file.name.to_owned()),
+                    (entry.file.size.unwrap_or_default(), entry.file.sha256.unwrap_or_default().to_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(release, runtime, "Windows release model contract drifted from the Rust downloader");
+        Ok(())
+    }
+
+    #[test]
     fn model_manifest_is_pinned_and_bounded() {
         assert_eq!(MODEL_FILES.len(), 6);
         assert_eq!(MODEL_FILES.iter().filter_map(|entry| entry.file.size).sum::<u64>(), MODEL_BYTES);
