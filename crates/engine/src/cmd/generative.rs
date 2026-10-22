@@ -118,7 +118,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Generative Fill",
             [],
             None,
-            "{maskId, backend?: native|comfy (native default), prompt?: text (empty removes), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512 (native model patch size; output stays full resolution), denoise?: 0.99 native|1 comfy, maskMargin?: 0..64 (native default 0), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — generate selected mask as a new PNG and library photo; original is retained → {id, path, original}",
+            "{maskId, prompt: replacement description (required; use photo.generativeRemove for removal), backend?: native|comfy (native default), negative?, steps?: 24, guidance?: 7.5, seed?, edge?: 512 (native model patch size; output stays full resolution), denoise?: 0.99 native|1 comfy, maskMargin?: 0..64 (native default 0), endpoint?: localhost ComfyUI URL, checkpoint?: installed checkpoint filename, dir?: demo destination} — generate selected mask as a new PNG and library photo; original is retained → {id, path, original}",
             has_active,
             fill
         ),
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn native_defaults_to_partial_denoise_and_comfy_keeps_full_strength() {
-        let native = options_for(&json!({}), false).unwrap();
+        let native = options_for(&json!({"prompt":"orange fabric"}), false).unwrap();
         assert_eq!(native.operation, Operation::Fill);
         assert_eq!(options_for(&json!({}), true).unwrap().operation, Operation::Remove);
         assert!(options_for(&json!({"edge":256}), true).is_err());
@@ -160,12 +160,34 @@ mod tests {
         assert_eq!(native.mask_margin, 0);
         assert_eq!(options_for(&json!({}), true).unwrap().mask_margin, REMOVE_MASK_MARGIN);
         assert_eq!(options_for(&json!({"maskMargin":0}), true).unwrap().mask_margin, 0);
-        let comfy = options_for(&json!({"backend":"comfy","checkpoint":"inpaint.safetensors"}), false).unwrap();
+        let comfy = options_for(&json!({"backend":"comfy","checkpoint":"inpaint.safetensors","prompt":"orange fabric"}), false).unwrap();
         assert_eq!(comfy.denoise, 1.0);
         assert_eq!(options_for(&json!({"backend":"comfy","checkpoint":"inpaint.safetensors"}), true).unwrap().mask_margin, 0);
         assert!(options_for(&json!({"maskMargin":65}), false).is_err());
         assert!(options_for(&json!({"maskMargin":-1}), false).is_err());
         assert!(options_for(&json!({"backend":"comfy","checkpoint":"inpaint.safetensors","maskMargin":1}), false).is_err());
+    }
+
+    #[test]
+    fn fill_requires_a_description_before_loading_a_model_or_changing_the_photo() {
+        let mut s = crate::Session::with_demo();
+        let source = s.active().unwrap();
+        s.generator.dir = Some(std::env::temp_dir().join(format!("lc-fill-no-model-{}", std::process::id())));
+        s.execute("mask.add", &json!({"kind":"radial"})).unwrap();
+        let mask = s.active_mask.unwrap();
+        let before = s.catalog.photo(source).unwrap().clone();
+        let undo_before = s.undo.len();
+        let photos_before = s.catalog.photos().count();
+        for prompt in [Value::Null, json!(""), json!(" \t\n")] {
+            let error = s.execute("photo.generativeFill", &json!({"maskId":mask,"prompt":prompt})).unwrap_err().to_string();
+            assert!(error.contains("Describe the replacement for Fill"), "{error}");
+            assert!(error.contains("Remove"), "{error}");
+            assert_eq!(s.catalog.photos().count(), photos_before);
+            assert_eq!(s.undo.len(), undo_before);
+            assert_eq!(s.catalog.photo(source).unwrap().develop, before.develop);
+            assert_eq!(s.active_mask, Some(mask));
+        }
+        assert!(options_for(&json!({}), true).is_ok(), "Remove needs no replacement description");
     }
 
     /// Explicit developer QA: downloads are separate from this test and all test pictures

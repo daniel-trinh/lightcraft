@@ -8,7 +8,7 @@ This fork runs MI-GAN removal and SD 1.5 prompt-based Fill inside Lightcraft thr
 2. **Remove** is ready when the portable package's `models` folder is present. Select the whole distraction, including its shadow, and choose Remove. No Fill model download is needed for removal.
 3. For **Fill**, read the CreativeML OpenRAIL-M model licence, check the consent box, and click **Download model**. The pinned checkpoint and tokenizer files total 2.13 GB. Downloading does not start until you click the button; checking consent alone does nothing. Consent is not stored in saved UI settings.
 4. The app shows download progress and supports cancellation and resuming partial files. Each file is checked against its pinned size and SHA-256 before installation.
-5. Enter a replacement prompt and click **Fill**. For procedural demo photos, enter an output folder too.
+5. Enter a replacement description and click **Fill**. Fill requires nonblank text; use **Remove** to reconstruct the background without a replacement description. For procedural demo photos, enter an output folder too.
 
 Generation runs on a background thread, with progress and cancellation between steps. The optional `cuda` build selects an NVIDIA GPU and reports initialization failures instead of silently falling back to CPU. Other Windows/Linux builds use CPU; macOS uses Metal when available, otherwise CPU. The panel and `generative.model.status` show the configured inference backend. Preparing/loading the model cannot currently be interrupted midway; a cancellation request is honored when that stage finishes. The model is released when the job finishes. See [Windows CUDA packaging](cuda-windows.md) for the portable runtime layout and GPU target.
 

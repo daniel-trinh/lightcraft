@@ -56,6 +56,9 @@ pub enum Operation {
 
 impl Options {
     pub fn validate(&self) -> Result<(), String> {
+        if self.operation == Operation::Fill && self.prompt.trim().is_empty() {
+            return Err("Describe the replacement for Fill, or choose Remove to reconstruct the background".into());
+        }
         if self.mask_margin > 64 {
             return Err("maskMargin must be 0..64 model pixels".into());
         }

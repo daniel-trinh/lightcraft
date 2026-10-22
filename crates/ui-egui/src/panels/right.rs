@@ -401,7 +401,7 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         if let Some(error) = &download.error {
             ui.label(format!("Model setup: {error}"));
         }
-        ui.label("Replacement prompt (Fill only)");
+        ui.label("Replacement description (required for Fill)");
         let r = ui.text_edit_singleline(&mut app.ui.generative_prompt);
         register(ui.ctx(), "field:generativePrompt", r.rect);
         ui.label("Negative prompt (Fill only, optional)");
@@ -420,7 +420,10 @@ fn generative_fill(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         let running = app.tasks.is_running(LABEL);
         let (fill_clicked, remove_clicked) = ui
             .horizontal(|ui| {
-                let fill = ui.add_enabled(installed && selected.is_some() && !running, egui::Button::new("Fill"));
+                let fill = ui.add_enabled(
+                    installed && selected.is_some() && !running && !app.ui.generative_prompt.trim().is_empty(),
+                    egui::Button::new("Fill"),
+                );
                 register(ui.ctx(), "button:generativeFill", fill.rect);
                 let remove = ui.add_enabled(removal.is_ok() && selected.is_some() && !running, egui::Button::new("Remove"));
                 register(ui.ctx(), "button:generativeRemove", remove.rect);
