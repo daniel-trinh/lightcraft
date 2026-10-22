@@ -3053,6 +3053,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "fancy-regex",
+ "image",
  "lightcraft-fetch",
  "serde_json",
  "thiserror 2.0.21",

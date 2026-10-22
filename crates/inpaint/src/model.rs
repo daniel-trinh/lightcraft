@@ -267,9 +267,9 @@ fn validate_input(rgb: &[u8], mask: &[u8], width: usize, height: usize) -> Resul
 }
 
 /// Small deterministic normal generator for initial latent noise; avoids a native RNG library.
-struct Noise(u64);
+pub(crate) struct Noise(u64);
 impl Noise {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
     }
     fn uniform(&mut self) -> f64 {
@@ -279,7 +279,7 @@ impl Noise {
         let n = self.0.wrapping_mul(0x2545F4914F6CDD1D);
         ((n >> 11) as f64 + 0.5) * (1.0 / ((1u64 << 53) as f64))
     }
-    fn tensor(&mut self, shape: (usize, usize, usize, usize), device: &Device, dtype: DType) -> Result<Tensor> {
+    pub(crate) fn tensor(&mut self, shape: (usize, usize, usize, usize), device: &Device, dtype: DType) -> Result<Tensor> {
         let count = shape.0 * shape.1 * shape.2 * shape.3;
         let mut values = Vec::with_capacity(count);
         while values.len() < count {

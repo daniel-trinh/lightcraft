@@ -6,7 +6,11 @@ transformer/VAE checks at a 1024-pixel canvas. Managed-download primitives pin
 15.98 GB of Apache-2.0 model files. These components are not connected to desktop
 Fill/Remove yet, so the workflow and quality limits below still describe the
 current app. Component agreement does not establish complete native generation
-quality; see the [inpaint crate notes](../crates/inpaint/README.md).
+quality. A native CUDA orchestration API and developer image probe now also run
+complete images: the NASA badge and coffee spoon were removed with explicit
+erased-mask conditioning, and prompt Fill produced a blue fabric patch. These
+are developer probes; desktop wiring and release validation remain unfinished.
+See the [inpaint crate notes](../crates/inpaint/README.md).
 
 This fork runs MI-GAN removal and SD 1.5 prompt-based Fill inside Lightcraft through Candle. Portable CUDA packages include the small MIT-licensed removal model; Fill offers a separate one-time download. No ComfyUI, Python runtime, separate server, or cloud image upload is required for the desktop workflow. Optional NVIDIA builds use CUDA kernels and bundled runtime libraries; CPU builds use Rust inference.
 

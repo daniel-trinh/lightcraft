@@ -9,6 +9,8 @@ pub use model::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod download;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod klein;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod klein_download;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod klein_sampling;

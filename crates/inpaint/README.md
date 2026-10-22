@@ -32,7 +32,7 @@ with Diffusers at 128 and 1024 pixels on CUDA. It rejects CPU inputs above 64 pi
 the Candle CPU convolution path diverges at larger sizes. This restriction is
 explicit; the intended Klein product path is CUDA. `klein_vae_parity` reproduces
 the component comparison from local checkpoint and fixture files. No full Klein
-generation path or desktop integration is provided yet. `klein_download` supplies
+desktop integration is provided yet. `klein_download` supplies
 the managed-installation primitives: six required runtime files (15.98 GB) pinned
 by size and SHA-256, with resume, progress and cancellation through
 `lightcraft-fetch`. It is not connected to desktop model setup yet. No gated
@@ -43,3 +43,20 @@ IDs, bilinear mask reduction and inpaint preservation blend. Captured reference
 tests matched the schedule/IDs/masks and BF16 step intermediates exactly. Keeping
 the reference dtype order matters: BF16 products round before the later F32
 addition in the Euler update. These helpers are not yet a desktop generation job.
+
+`klein::generate` assembles the native CUDA pipeline with separate model phases:
+Qwen features, F32 VAE encoding, BF16 transformer denoising and F32 VAE decoding.
+Each large model is released before the next phase. It supports cancellation and
+phase/step progress, requires the pinned four-step checkpoint, and returns the
+whole generated RGB canvas. The caller must composite the original soft mask
+and preserve source/catalog state. There is no Python, service or CPU fallback.
+
+The developer-only `klein_inpaint_image` probe ran NASA badge and coffee spoon
+photos on an RTX 4090. Full-image conditioning removed both with object-specific
+instructions and produced a blue fabric replacement. Generic instructions with
+full-image conditioning left the NASA badge intact. The explicit `ErasedMask`
+conditioning mode instead encodes a separate white-erased selection as reference
+tokens while retaining clean source latents for preservation; generic white-area
+instructions removed both objects in the probes. Original-mask-zero pixels were
+byte-identical in the test composites. These two photos do not establish broad
+removal accuracy, and desktop command, undo, setup and packaging checks remain.
