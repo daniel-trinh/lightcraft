@@ -17,6 +17,49 @@ fn temp_dir(tag: &str) -> PathBuf {
     d
 }
 
+#[test]
+fn preset_exports_keep_existing_files_on_write_failure_and_protect_originals() {
+    use lightcraft_catalog::{Op, Photo, PhotoId, Source};
+
+    let dir = temp_dir("export-write-safety");
+    let original = dir.join("photo.jpg");
+    std::fs::write(&original, b"original photo").unwrap();
+    let mut s = Session::new().with_fs();
+    s.catalog
+        .apply(Op::AddPhoto {
+            photo: Box::new(Photo::new(
+                PhotoId(1),
+                Source::File { path: original.to_string_lossy().to_string() },
+                "photo.jpg",
+                "JPEG",
+                2,
+                2,
+                "2026-01-01",
+            )),
+        })
+        .unwrap();
+
+    let builtin = s.presets.iter().find(|p| p.builtin).unwrap().id.clone();
+    for (command, extra, name) in
+        [("preset.export", json!({"ids": [builtin]}), "presets.lcpreset"), ("curve.exportPresets", json!({"names": ["Linear"]}), "curves.lccurve")]
+    {
+        let mut params = extra;
+        params["path"] = json!(original.to_string_lossy());
+        assert!(s.execute(command, &params).is_err(), "{command} must protect a catalogued original");
+        assert_eq!(std::fs::read(&original).unwrap(), b"original photo");
+
+        let output = dir.join(name);
+        std::fs::write(&output, b"previous export").unwrap();
+        params["path"] = json!(output.to_string_lossy());
+        {
+            let _fault = lightcraft_catalog::safe_file::fail_writes_after(8);
+            assert!(s.execute(command, &params).is_err(), "{command} must report the failed write");
+        }
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous export", "{command} must retain the previous file");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn user_preset(id: &str, settings: serde_json::Value) -> Preset {
     Preset { id: id.into(), name: id.into(), group: "User Presets".into(), settings, favorite: false, builtin: false }
 }
@@ -25,6 +68,35 @@ fn with_presets(s: &mut Session) {
     s.presets.push(user_preset("user.rawlook", json!({"light": {"exposure": 0.5}, "effects": {"clarity": 20.0}})));
     s.presets.push(user_preset("user.canonlook", json!({"light": {"contrast": 35.0}})));
     s.presets.push(user_preset("user.jpeglook", json!({"color": {"vibrance": 15.0}})));
+}
+
+/// Regression proof: switching libraries must load that library's preset for a colliding ID.
+#[test]
+fn switching_libraries_does_not_overwrite_a_colliding_preset() {
+    let root = temp_dir("switch-preset-collision");
+    let (a, b) = (root.join("a"), root.join("b"));
+    let id = "user.0.shared";
+    let preset_a = user_preset(id, json!({"light": {"exposure": 0.5}}));
+    let preset_b = user_preset(id, json!({"light": {"exposure": 1.5}}));
+    for (dir, preset) in [(&a, &preset_a), (&b, &preset_b)] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("presets.json"), serde_json::to_vec(&json!({"user": [preset]})).unwrap()).unwrap();
+    }
+
+    let mut s = Session::new().with_fs();
+    s.open_library(&a, false).unwrap();
+    s.close_library().unwrap();
+    s.open_library(&b, false).unwrap();
+    // Any preset edit saves the retained A preset over B's file.
+    s.execute("preset.rename", &json!({"id": id, "name": "Renamed"})).unwrap();
+    s.close_library().unwrap();
+    drop(s);
+
+    let mut fresh = Session::new().with_fs();
+    fresh.open_library(&b, false).unwrap();
+    assert_eq!(fresh.presets.iter().find(|p| p.id == id).unwrap().settings, preset_b.settings);
+    drop(fresh);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn dng(dir: &Path, name: &str, make: &str, model: &str) {

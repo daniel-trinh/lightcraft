@@ -226,7 +226,13 @@ pub(crate) fn rename_folder_on_disk(from: &str, to: &str) -> std::result::Result
         return Err(format!("{from} is not a folder (moved or deleted?)"));
     }
     let case_only = from != to && from.to_lowercase() == to.to_lowercase();
-    if dst.exists() && !case_only {
+    // Two differently cased names can denote distinct directories on a case-sensitive volume.
+    // Canonical paths are equal only when the destination already names this very directory;
+    // a symlink is still a separate entry and must not be replaced.
+    let same_entry = !crate::import_move::is_symlink(src)
+        && !crate::import_move::is_symlink(dst)
+        && std::fs::canonicalize(src).ok().is_some_and(|a| std::fs::canonicalize(dst).ok().as_ref() == Some(&a));
+    if std::fs::symlink_metadata(dst).is_ok() && !(case_only && same_entry) {
         return Err(format!("{to} already exists"));
     }
     if dst.starts_with(src) {
@@ -240,13 +246,13 @@ pub(crate) fn rename_folder_on_disk(from: &str, to: &str) -> std::result::Result
         if tmp.exists() {
             return Err(format!("{} already exists", tmp.display()));
         }
-        std::fs::rename(src, &tmp).map_err(|e| format!("{from} → {to}: {e}"))?;
-        return std::fs::rename(&tmp, dst).map_err(|e| {
-            let _ = std::fs::rename(&tmp, src);
-            format!("{from} → {to}: {e}")
+        lightcraft_sysfs::rename_no_replace(src, &tmp).map_err(|e| format!("{from} → {to}: {e}"))?;
+        return lightcraft_sysfs::rename_no_replace(&tmp, dst).map_err(|e| match lightcraft_sysfs::rename_no_replace(&tmp, src) {
+            Ok(()) => format!("{from} → {to}: {e}"),
+            Err(restore) => format!("{from} → {to}: {e}; could not restore the old name ({restore}); folder retained at {}", tmp.display()),
         });
     }
-    std::fs::rename(src, dst).map_err(|e| format!("{from} → {to}: {e}"))
+    lightcraft_sysfs::rename_no_replace(src, dst).map_err(|e| format!("{from} → {to}: {e}"))
 }
 
 /// After a folder moved from `from` to `to`: a browsed folder at or below it follows.

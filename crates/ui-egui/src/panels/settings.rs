@@ -458,12 +458,12 @@ fn smart_previews(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let mut mode: u8 = ui.data(|d| d.get_temp(mode_id)).unwrap_or(0);
     if count > 0 {
         row(ui, t, crate::i18n::tr("Existing previews"), |ui| {
-            if choices(ui, "settingsSmartExisting", &[(0u8, "Move them"), (1, "Leave them"), (2, "Delete them")], &mut mode) {
+            if choices(ui, "settingsSmartExisting", &[(0u8, "Copy; keep old copies"), (1, "Leave them")], &mut mode) {
                 ui.data_mut(|d| d.insert_temp(mode_id, mode));
             }
         });
     }
-    let existing = ["move", "leave", "discard"][mode.min(2) as usize];
+    let existing = ["move", "leave"][mode.min(1) as usize];
     let mut result = None;
     ui.horizontal(|ui| {
         ui.add_space(LABEL_W);
@@ -489,7 +489,7 @@ fn smart_previews(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
                 let failed = v["failed"].as_array().map_or(0, Vec::len);
                 let msg = match (existing, v["handled"].as_u64().unwrap_or(0)) {
                     (_, 0) => "Smart previews folder changed".to_string(),
-                    ("move", n) => format!("Smart previews folder changed; moved {n}"),
+                    ("move", n) => format!("Smart previews folder changed; copied {n}, old copies retained"),
                     ("discard", n) => format!("Smart previews folder changed; deleted {n}"),
                     _ => "Smart previews folder changed".to_string(),
                 };

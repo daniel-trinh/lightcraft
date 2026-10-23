@@ -2911,6 +2911,7 @@ dependencies = [
  "crc32fast",
  "lightcraft-develop",
  "lightcraft-meta",
+ "lightcraft-sysfs",
  "log",
  "proptest",
  "serde",
@@ -3001,6 +3002,7 @@ dependencies = [
  "lightcraft-raw",
  "lightcraft-scenes",
  "lightcraft-segment",
+ "lightcraft-sysfs",
  "log",
  "miniz_oxide 0.8.9",
  "rayon",
@@ -3181,6 +3183,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "lightcraft-sysfs"
+version = "0.2.1"
+dependencies = [
+ "rustix 1.1.5",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

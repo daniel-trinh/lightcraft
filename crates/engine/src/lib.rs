@@ -304,6 +304,8 @@ impl Session {
 
     fn run_command(&mut self, id: &str, journal: Option<&Value>, f: impl FnOnce(&mut Session) -> Result<Value>) -> Result<Value> {
         let log_start = self.pending_log.len();
+        let presets_before = self.library.as_ref().map(|_| library::presets_json(self));
+        let prefs_dirty_before = self.library.as_ref().is_some_and(|l| l.prefs_dirty);
         let was_active = self.active();
         self.depth += 1;
         // last-resort guard: a panic in a command is that command's error, not a crash
@@ -337,8 +339,10 @@ impl Session {
             // persistence trouble (a failed compaction, an older queued change still unwritten by
             // a command that changed nothing) doesn't fail the command; `library.info` reports it.
             let produced = self.pending_log.len() > log_start;
+            let settings_changed = presets_before.as_ref().is_some_and(|before| *before != library::presets_json(self))
+                || (!prefs_dirty_before && self.library.as_ref().is_some_and(|l| l.prefs_dirty));
             if let Err(e @ EngineError::NotSaved(_)) = self.persist()
-                && produced
+                && (produced || settings_changed)
                 && r.is_ok()
             {
                 return Err(e);

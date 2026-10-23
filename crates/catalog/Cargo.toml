@@ -9,6 +9,7 @@ description = "LightCraft library: photos, albums, ratings/flags, search/filter/
 workspace = true
 
 [dependencies]
+lightcraft-sysfs = { workspace = true }
 lightcraft-develop = { workspace = true }
 lightcraft-meta = { workspace = true }
 serde = { workspace = true }

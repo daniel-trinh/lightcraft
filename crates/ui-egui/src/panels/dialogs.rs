@@ -811,7 +811,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                 let ok = match &dlg {
                     Dialog::Import { opts } => {
                         let n = opts.selected_paths().len();
-                        let verb = if opts.copy && opts.move_files { "Move" } else { "Import" };
+                        let verb = if opts.copy && opts.move_files { "Verified copy" } else { "Import" };
                         add_label = crate::i18n::tr_format!("{verb} {n} Photo{}", if n == 1 { "" } else { "s" }, verb = crate::i18n::tr(verb), n = n);
                         add_label.as_str()
                     }

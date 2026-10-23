@@ -20,8 +20,8 @@
 //!   it is then simply exported again.
 //! - [`write_new`] / [`write_new_unique`] write a file that must not exist yet: the same temp file
 //!   and sync, plus a read-back check, and the file then appears under its final name **without
-//!   replacing anything** (a hard link, which fails on a taken name; a check-then-rename where the
-//!   volume has no hard links).
+//!   replacing anything** (an exclusive hard link, else the OS atomic no-replace rename).
+//!   Unsupported platforms return an error; there is no check-then-rename fallback.
 //! - [`same_file`] tells whether two paths name the same file on disk (device + inode on Unix,
 //!   resolved paths elsewhere), for "is this target an original?" checks.
 
@@ -216,23 +216,21 @@ pub fn write_new_unique(candidates: &mut dyn Iterator<Item = PathBuf>, data: &[u
         }
         Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{}: no free file name", first.display())))
     })();
-    // after a hard link the temp name is a second name of the new file; after a rename it's gone
+    // After a hard link the temp is a second name; after an atomic rename it is already gone.
     let _ = fs::remove_file(&tmp);
     r
 }
 
 /// Give the complete temp file `tmp` the name `path`, unless that is taken.
 fn publish_new(tmp: &Path, path: &Path) -> io::Result<()> {
-    match fs::hard_link(tmp, path) {
+    publish_with(tmp, path, |a, b| fs::hard_link(a, b))
+}
+
+fn publish_with(tmp: &Path, path: &Path, link: impl FnOnce(&Path, &Path) -> io::Result<()>) -> io::Result<()> {
+    match link(tmp, path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
-        // no hard links on this volume (FAT/exFAT, some shares): check, then rename
-        Err(_) => {
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} exists", path.display())));
-            }
-            fs::rename(tmp, path)
-        }
+        Err(_) => lightcraft_sysfs::rename_no_replace(tmp, path),
     }
 }
 
@@ -282,6 +280,36 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_hard_links_never_fall_back_to_overwriting_rename() {
+        let d = temp("no-link");
+        let tmp = d.join("complete.tmp");
+        let dst = d.join("photo.dng");
+        fs::write(&tmp, b"new output").unwrap();
+        let result = publish_with(&tmp, &dst, |_, target| {
+            // A competing writer claims the name while publication is attempted.
+            fs::write(target, b"irreplaceable original")?;
+            Err(io::Error::new(io::ErrorKind::Unsupported, "no hard links"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&dst).unwrap(), b"irreplaceable original");
+        assert_eq!(fs::read(&tmp).unwrap(), b"new output");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    fn new_output_without_hard_links_uses_exclusive_native_rename() {
+        let d = temp("no-link-success");
+        let tmp = d.join("complete.tmp");
+        let dst = d.join("output.png");
+        fs::write(&tmp, b"complete output").unwrap();
+        publish_with(&tmp, &dst, |_, _| Err(io::Error::new(io::ErrorKind::Unsupported, "no links"))).unwrap();
+        assert_eq!(fs::read(dst).unwrap(), b"complete output");
+        assert!(!tmp.exists());
+        let _ = fs::remove_dir_all(d);
+    }
 
     fn temp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("lc-safe-file-{tag}-{}", std::process::id()));

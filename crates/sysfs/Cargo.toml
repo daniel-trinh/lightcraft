@@ -1,0 +1,20 @@
+[package]
+name = "lightcraft-sysfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atomic no-replace file and directory rename across supported native platforms"
+
+# The only unsafe code is an isolated Windows API call, documented in src/lib.rs.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "=1.1.5", default-features = false, features = ["fs", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

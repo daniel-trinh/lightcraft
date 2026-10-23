@@ -49,6 +49,14 @@ fn leftover_lock_files_are_not_a_lock() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn unavailable_lock_refuses_to_open() {
+    let dir = temp_dir("unavailable");
+    std::fs::create_dir(dir.join(LOCK)).unwrap();
+    assert!(matches!(LibraryLock::acquire(&dir, "LightCraft"), Err(LockError::Unavailable(_))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Another process holds the lock; when it is killed (a crash), the OS releases it.
 #[test]
 fn lock_held_by_another_process_is_released_when_it_dies() {

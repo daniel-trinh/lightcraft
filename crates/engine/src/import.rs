@@ -8,8 +8,8 @@
 //! 4. Skip **duplicates by content** (same bytes already in the library, or twice in this batch).
 //! 5. *Add* in place (the photo points at the original file), *copy* into the library's
 //!    `Originals/YYYY/YYYY-MM-DD/` folder (names made unique) and point at the copy, or *move*
-//!    there: placed like a copy (with its XMP sidecars), and the original removed only once its
-//!    catalog record is committed and saved (see [`crate::import_move`] for the safety rules).
+//!    there: placed like a copy (with its XMP sidecars), while the original and its sidecars stay
+//!    at the source (see [`crate::import_move`] for the safety rules).
 //! 6. Apply each photo's XMP sidecar (or a raw/DNG file's embedded XMP): the sidecar wins for
 //!    metadata and develop settings are restored (see [`crate::sidecar`]). Its capture time fills
 //!    in when the file has none (read before step 5, so it also files and names the copy).
@@ -43,8 +43,7 @@ pub enum ImportMode {
     Add,
     /// Copy the files into the library's `Originals/` folder.
     Copy,
-    /// Move the files there: as Copy, then each original (and its sidecars) is removed from the
-    /// source once the copy is verified and catalogued.
+    /// Put verified copies there, retaining each original and its sidecars at the source.
     Move,
 }
 
@@ -153,7 +152,7 @@ pub struct Duplicate {
 pub struct ImportReport {
     pub imported: Vec<u64>,
     pub duplicates: Vec<Duplicate>,
-    /// Move: the originals that were moved (and removed from the source).
+    /// Legacy field for older reports; retained sources are listed in `kept` instead.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub moved: Vec<Moved>,
     /// Move: originals (or sidecars) left at the source, and why — the photo may still have been
@@ -590,8 +589,8 @@ struct ReadyFile {
 }
 
 impl Prepared {
-    /// Undo what the batch did on disk that only a commit would make permanent: files placed by a
-    /// Move (their sources were never touched). Copies stay, like copies of a failed commit.
+    /// Abandon files placed by a Move whose catalog commit will not happen. Independently created
+    /// copies stay for recovery, like copies of a failed commit; sources are never touched.
     pub fn rollback(&self) {
         for it in &self.items {
             if let PreparedItem::Ready(r) = it
@@ -806,7 +805,8 @@ impl ImportJob {
             if let Some(h) = &info.content_hash {
                 self.by_hash.insert(h.clone(), None);
             }
-            // Copy as DNG: the copied raw becomes a DNG (the copy is ours to replace)
+            // Copy as DNG: convert the copied raw into a new DNG. Keep the intermediate raw copy
+            // for recovery: its path might have been replaced while conversion was running.
             let mut stored = stored;
             if opts.convert_dng
                 && mode == ImportMode::Copy
@@ -816,7 +816,7 @@ impl ImportJob {
             {
                 match crate::cmd::convert::write_dng_with(self.file_bytes.as_ref(), &stored, String::new()) {
                     Ok(dng) => {
-                        let _ = std::fs::remove_file(&stored);
+                        log::info!("Copy as DNG retained raw copy at {stored} for recovery");
                         stored = dng;
                         info.format = "DNG".into();
                     }
@@ -830,8 +830,8 @@ impl ImportJob {
 }
 
 /// The catalog half of an import: add the photos [`ImportJob::prepare`] readied (one undoable op;
-/// a Move's sources are removed once it is saved). On a failed commit a Move's placed files are
-/// taken back.
+/// a Move's sources remain at the source). On a failed commit a Move's placed files are
+/// retained for recovery.
 pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepared: Prepared) -> crate::Result<ImportReport> {
     let now = now.to_string();
     let mut report = ImportReport { scanned: prepared.scanned, ..Default::default() };
@@ -911,7 +911,7 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
     if !ops.is_empty()
         && let Err(e) = s.commit(&format!("Add {} Photo{}", ops.len(), if ops.len() == 1 { "" } else { "s" }), Op::Batch { ops })
     {
-        // nothing was catalogued: take the moves back (their sources were never touched)
+        // nothing was catalogued: retain the independent copies for recovery
         placed.iter().for_each(crate::import_move::rollback);
         return Err(e);
     }
@@ -921,8 +921,8 @@ pub fn commit_prepared(s: &mut Session, opts: &ImportOptions, now: &str, prepare
     Ok(report)
 }
 
-/// Move, after the commit: save the library, then remove each source whose destination is
-/// still intact. Nothing is removed when the library can't be saved.
+/// Move, after the commit: save the library, then verify each copy and report the originals as
+/// retained. Nothing is removed from the source.
 fn finish_moves(s: &mut Session, placed: Vec<crate::import_move::Placed>, log0: usize, report: &mut ImportReport) {
     // (saving here clears the pending ops, so the sidecars `execute` would auto-write are written here)
     let auto: Vec<Op> = if s.xmp.auto_write { s.pending_log.get(log0..).map(<[Op]>::to_vec).unwrap_or_default() } else { Vec::new() };
@@ -936,17 +936,17 @@ fn finish_moves(s: &mut Session, placed: Vec<crate::import_move::Placed>, log0: 
     }
     for p in placed {
         let from = p.src.to_string_lossy().to_string();
-        match crate::import_move::finish(&p) {
-            Ok(kept) => {
-                let sidecars = p.sidecars.iter().map(|sc| sc.dst.to_string_lossy().to_string()).collect();
-                report.moved.push(Moved { from, to: p.dst.to_string_lossy().to_string(), sidecars });
-                report.kept.extend(kept.into_iter().map(|(path, reason)| Kept { path, reason }));
+        let reason = match crate::import_move::finish(&p) {
+            Ok(()) => {
+                let n = p.sidecars.len();
+                format!("a verified copy is at {}; the original and {n} XMP sidecar(s) remain at the source", p.dst.display())
             }
             Err(reason) => {
                 log::warn!("import: move {from}: {reason}");
-                report.kept.push(Kept { path: from, reason });
+                format!("{reason}; any XMP sidecars remain at the source")
             }
-        }
+        };
+        report.kept.push(Kept { path: from, reason });
     }
     if s.pending_log.len() < before && s.interaction.is_none() && !auto.is_empty() {
         s.auto_write_sidecars(&auto);

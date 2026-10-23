@@ -30,8 +30,7 @@ pub struct ImportDialog {
     pub checked: Vec<bool>,
     /// Copy into the library (else add in place).
     pub copy: bool,
-    /// With `copy`: move instead — the originals are removed from the source once each copy is
-    /// verified and catalogued (`library.import` mode `move`).
+    /// With `copy`: verify independent copies, retaining originals (`library.import` mode `move`).
     pub move_files: bool,
     /// Existing album to add to.
     pub album: Option<u64>,
@@ -614,11 +613,8 @@ fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
     } else {
         crate::i18n::tr_format!("Imported {} photo{}", task.imported, plural(task.imported))
     };
-    if task.params["mode"] == "move" {
-        msg.push_str(&crate::i18n::tr_format!(" · {} moved", task.moved));
-        if task.kept > 0 {
-            msg.push_str(&format!(" · {} original{} left at the source", task.kept, plural(task.kept)));
-        }
+    if task.params["mode"] == "move" && task.kept > 0 {
+        msg.push_str(&format!(" · {} original{} left at the source", task.kept, plural(task.kept)));
     }
     if task.duplicates > 0 {
         msg.push_str(&crate::i18n::tr_format!(" · {} duplicate{} skipped", task.duplicates, if task.duplicates == 1 { "" } else { "s" }));
@@ -778,11 +774,10 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
             d.copy = true;
             d.move_files = false;
         }
-        let r =
-            ui.add_enabled_ui(can_copy, |ui| crate::widgets::text_button(ui, "importMove", crate::i18n::tr("Move"), d.copy && d.move_files)).inner;
-        if r.on_hover_text(crate::i18n::tr("Move the files (into the library's Originals/, or a folder you choose), removing them from the source"))
-            .clicked()
-        {
+        let r = ui
+            .add_enabled_ui(can_copy, |ui| crate::widgets::text_button(ui, "importMove", crate::i18n::tr("Verified copy"), d.copy && d.move_files))
+            .inner;
+        if r.on_hover_text(crate::i18n::tr("Make verified independent copies; keep source files and sidecars for recovery")).clicked() {
             d.copy = true;
             d.move_files = true;
         }
@@ -793,7 +788,7 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
                 "Copy: the files are copied to the folder below and the library uses the copies; the originals are left as they are."
             }
             (true, true) => {
-                "Move: the files are moved to the folder below; each original (and its XMP sidecar) is removed from the source only after its copy is verified. Duplicates and files that fail stay where they are."
+                "Verified copy: the library uses independent, verified copies. Source media and XMP sidecars stay in place. Automatic source deletion is disabled until recoverable cleanup is available."
             }
             _ => "Add in place: the library references the files where they are; nothing is copied or moved.",
         })
@@ -802,7 +797,7 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
     );
     register(ui.ctx(), "label:importModeHelp", r.rect);
     if d.copy {
-        field(ui, if d.move_files { "Move to" } else { "Copy to" }, |ui| {
+        field(ui, "Copy to", |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let shown = if d.destination.trim().is_empty() { "Library Originals".to_string() } else { d.destination.clone() };
             ui.label(egui::RichText::new(shown).color(Tokens::get(ui.ctx()).text_label));

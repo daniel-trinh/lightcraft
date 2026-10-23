@@ -266,13 +266,19 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
         let stem = src.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| "photo".into());
         let ext = src.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
         let dir = src.parent().unwrap_or(Path::new(""));
-        let mut dst = dir.join(format!("{stem}-copy{ext}"));
-        let mut n = 2;
-        while dst.exists() {
-            dst = dir.join(format!("{stem}-copy-{n}{ext}"));
-            n += 1;
+        let mut dst = None;
+        for n in 1..100_000u32 {
+            let candidate = if n == 1 { dir.join(format!("{stem}-copy{ext}")) } else { dir.join(format!("{stem}-copy-{n}{ext}")) };
+            match crate::import_move::copy_verified(src, &candidate, None) {
+                Ok(()) => {
+                    dst = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(bad(C, format!("{path}: {e}"))),
+            }
         }
-        std::fs::copy(src, &dst).map_err(|e| bad(C, format!("{path}: {e}")))?;
+        let dst = dst.ok_or_else(|| bad(C, format!("{path}: no free duplicate name")))?;
         let new = s.catalog.alloc_photo_id();
         let mut q = ph.clone();
         q.id = new;

@@ -121,6 +121,7 @@ struct SmartCounts {
     /// Of those, damaged ones (cut short by a crash or a full drive) that were rebuilt.
     repaired: usize,
     removed: usize,
+    recovery: Vec<String>,
     /// `[[id, why]]`
     failed: Vec<Value>,
 }
@@ -150,8 +151,18 @@ fn smart_run(
             break;
         }
         if discard {
-            if std::fs::remove_file(&path).is_ok() {
-                n.removed += 1;
+            match crate::smart::discard_recoverably(&path) {
+                Ok(recovery) => {
+                    n.removed += 1;
+                    n.recovery.push(recovery.to_string_lossy().to_string());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    n.failed.push(json!([id.0, e.to_string()]));
+                    if let Some(st) = state {
+                        st.failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         } else {
             // a complete proxy is kept; a missing or damaged one (cut short by a crash or a full
@@ -236,7 +247,7 @@ fn smart(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(state.json());
     }
     let r = smart_run(&dir, custom, discard, jobs, None).map_err(|e| bad(C, e))?;
-    Ok(json!({"built": r.built, "repaired": r.repaired, "removed": r.removed, "failed": r.failed}))
+    Ok(json!({"built": r.built, "repaired": r.repaired, "removed": r.removed, "recovery": r.recovery, "failed": r.failed}))
 }
 
 /// The smart previews folder: where it is, whether it is custom, what it holds, whether it can be
@@ -278,8 +289,11 @@ fn smart_location(s: &mut Session, p: &Value) -> Result<Value> {
         }
         _ => (default, None),
     };
-    if new_dir == current {
+    if crate::smart::same_directory(&new_dir, &current) {
         return Ok(location_json(s));
+    }
+    if s.preview_build.as_ref().is_some_and(|b| !b.finished.load(Ordering::Relaxed)) {
+        return Err(bad(C, "wait for the preview build to finish or cancel it before changing folders"));
     }
     // the new place must work before anything moves; there is no fallback to another drive
     crate::smart::check_writable(&new_dir).map_err(|e| bad(C, e))?;
@@ -292,13 +306,26 @@ fn smart_location(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(existing) = existing else {
         return Err(bad(C, format!("{held} smart preview(s) are in {}: pass existing = move, leave or discard", current.display())));
     };
-    let (moved, failed) = crate::smart::migrate(&current, &new_dir, existing);
+    // Copy first, retaining the old proxies. A conflict leaves both folders available for recovery
+    // and the old preference active; an unreadable settings file must not strand the previews.
+    let (mut moved, mut failed) = (0, Vec::new());
+    if existing == crate::smart::Existing::Move {
+        (moved, failed) = crate::smart::migrate(&current, &new_dir, existing);
+        if !failed.is_empty() {
+            return Err(bad(C, format!("smart previews folder unchanged; old copies retained: {}", failed.join("; "))));
+        }
+    }
+    let previous = s.smart_previews_dir.clone();
     s.smart_previews_dir = custom;
+    if let Err(e) = s.save_prefs() {
+        s.smart_previews_dir = previous;
+        return Err(e);
+    }
     s.media.smart_dir = Some(new_dir);
-    s.save_prefs()?;
     let mut r = location_json(s);
     r["handled"] = json!(moved);
     r["failed"] = json!(failed);
+    r["retainedOriginalCopies"] = json!(existing != crate::smart::Existing::Leave);
     Ok(r)
 }
 
@@ -318,7 +345,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Build Smart Previews",
             [],
             None,
-            "{ids?, discard?: bool, background?: bool} — build (or discard) the smart previews of the selected photos (else all in view): compact proxies in the library that keep photos editable and exportable (at proxy size) while their originals are offline; a damaged proxy (cut short) is rebuilt → {built, repaired, removed, failed}; with background (the app's menu) the files are read and written on a worker thread → {total, done, failed, repaired, running, what} like library.buildPreviews (progress: library.previewProgress, stop: library.cancelPreviews)",
+            "{ids?, discard?: bool, background?: bool} — build (or discard) the smart previews of the selected photos (else all in view): compact proxies in the library that keep photos editable and exportable (at proxy size) while their originals are offline; a damaged proxy (cut short) is rebuilt; discard moves proxies into .lightcraft-preview-recovery in the preview folder, retaining their bytes → {built, repaired, removed, recovery, failed}; with background (the app's menu) the files are read and written on a worker thread → {total, done, failed, repaired, running, what} like library.buildPreviews (progress: library.previewProgress, stop: library.cancelPreviews)",
             always,
             smart
         ),
@@ -328,7 +355,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Smart Previews Location",
             [],
             None,
-            "{path?: absolute folder, reset?: bool, existing?: move|leave|discard} — without path/reset: where this library keeps its smart previews → {path, default, custom, available, count, bytes}. With path (or reset = back to `Smart Previews` in the library): use that folder instead (must exist or have an existing parent, and accept writes; never falls back to another drive). Smart previews already in the old folder need `existing`: move them, leave them (build again), or discard them → also {handled, failed}",
+            "{path?: absolute folder, reset?: bool, existing?: move|leave|discard} — without path/reset: where this library keeps its smart previews → {path, default, custom, available, count, bytes}. With path (or reset = back to `Smart Previews` in the library): use that folder instead (must exist or have an existing parent, and accept writes). Smart previews already in the old folder need `existing`: move copies them and retains the old copies for recovery, leave keeps them (build again), legacy discard also leaves old copies untouched → also {handled, failed, retainedOriginalCopies}. Aliases of the current folder do nothing; conflicting files are never replaced.",
             always,
             smart_location
         ),

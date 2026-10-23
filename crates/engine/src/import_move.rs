@@ -1,21 +1,19 @@
 //! Import → **Move**: the file transfer behind [`crate::import::ImportMode::Move`].
 //!
-//! Moving deletes the user's originals, so it is done in two phases and every step that could
-//! lose data comes last:
+//! A Move import places independent verified copies in the destination and keeps the originals
+//! and their sidecars at the source. Deleting an original after checking its path would have a
+//! compare-then-unlink race: another process could replace it between those operations.
 //!
 //! 1. [`place`] puts the photo (and its XMP sidecars) at the destination **without touching the
-//!    source**: a hard link when source and destination share a volume (instant, no extra space,
-//!    never overwrites), else a copy that is written to a new file (never overwriting), synced to
+//!    source**: a copy written to a new file (never overwriting), synced to
 //!    disk and compared byte for byte with the original. A name that is taken gets -1, -2…
-//!    Anything that fails is undone ([`rollback`]): the partial destination is removed and the
-//!    source stays as it was.
-//! 2. Only after the catalog records pointing at the destinations were committed and saved
-//!    does [`finish`] remove each source — after checking once more that its destination is
-//!    still there with the same size. A source that can't be removed (a read-only card, a
-//!    locked file) stays and is reported; the photo is then imported from the copy.
+//!    Failed or uncommitted copies are retained for recovery ([`rollback`]); the source stays.
+//! 2. Once the catalog records pointing at the destinations were committed and saved,
+//!    [`finish`] checks that both files still have the placed content. It never unlinks source
+//!    media or sidecars; the report identifies each retained original.
 //!
-//! A `IMG_1.xmp` sidecar is shared by `IMG_1.CR3` and `IMG_1.JPG`: it is copied along with each,
-//! and removed from the source only once no photo with that name is left beside it.
+//! A `IMG_1.xmp` sidecar may be shared by `IMG_1.CR3` and `IMG_1.JPG`; it is copied along with
+//! each and stays at the source.
 //!
 //! (Not `std::fs::rename`: it would remove the source before the catalog knows the new place,
 //! and on Unix it silently replaces an existing destination.)
@@ -29,17 +27,9 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Placed {
     pub src: PathBuf,
     pub dst: PathBuf,
-    pub sidecars: Vec<PlacedSidecar>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PlacedSidecar {
-    pub src: PathBuf,
-    pub dst: PathBuf,
-    /// `false`: an identical sidecar was already there (the other half of a raw + JPEG pair).
-    pub created: bool,
-    /// Named after the photo's stem (`IMG_1.xmp`), so possibly shared with a sibling photo.
-    pub stem: bool,
+    /// Content verified when the independent destination copy was placed.
+    pub hash: lightcraft_preview::Hash128,
+    pub sidecars: Vec<PathBuf>,
 }
 
 /// Test-only fault injection (per thread), to exercise the failure paths.
@@ -48,14 +38,12 @@ pub(crate) struct PlacedSidecar {
 pub(crate) enum Fault {
     #[default]
     None,
-    /// Hard links fail, as across volumes: the copy path runs.
+    /// Kept for the cross-volume copy regression fixture; placement now always copies.
     NoLink,
     /// Writing the copy fails half-way (implies `NoLink`).
     FailWrite,
     /// The copy comes out different from the original, caught by the verification (implies `NoLink`).
     Corrupt,
-    /// Removing the source fails (as on a read-only card).
-    FailRemove,
 }
 
 #[cfg(test)]
@@ -124,7 +112,7 @@ pub(crate) fn sidecars_of(src: &Path) -> Vec<(PathBuf, bool)> {
 }
 
 /// Put `src` into `dir` as `name` (-1, -2… when taken) with its sidecars, leaving the source
-/// untouched. On failure nothing is left at the destination.
+/// untouched. On failure a partial destination may remain for recovery; the error names it.
 pub(crate) fn place(src: &Path, dir: &Path, name: &str) -> Result<Placed, String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (stem, ext) = match name.rsplit_once('.') {
@@ -134,7 +122,7 @@ pub(crate) fn place(src: &Path, dir: &Path, name: &str) -> Result<Placed, String
     let mut dst = None;
     for i in 0..100_000u32 {
         let d = if i == 0 { dir.join(name) } else { dir.join(format!("{stem}-{i}{ext}")) };
-        match link_or_copy(src, &d) {
+        match copy_verified(src, &d, None) {
             Ok(()) => {
                 dst = Some(d);
                 break;
@@ -144,7 +132,17 @@ pub(crate) fn place(src: &Path, dir: &Path, name: &str) -> Result<Placed, String
         }
     }
     let Some(dst) = dst else { return Err(format!("move {}: no free name in {}", src.display(), dir.display())) };
-    let mut placed = Placed { src: src.to_path_buf(), dst, sidecars: Vec::new() };
+    let hash = match hash_file(&dst) {
+        Ok(hash) => hash,
+        Err(e) => {
+            return Err(format!(
+                "move {}: cannot verify the destination {} ({e}); it remains for recovery and the original is kept",
+                src.display(),
+                dst.display()
+            ));
+        }
+    };
+    let mut placed = Placed { src: src.to_path_buf(), dst, hash, sidecars: Vec::new() };
     for (sc, stem_named) in sidecars_of(src) {
         let sc_ext = sc.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "xmp".into());
         let sc_dst =
@@ -156,13 +154,13 @@ pub(crate) fn place(src: &Path, dir: &Path, name: &str) -> Result<Placed, String
                 Err(e) => Err(format!("{}: {e} (the original is kept)", sc_dst.display())),
             }
         } else {
-            link_or_copy(&sc, &sc_dst).map(|()| true).map_err(|e| format!("move {}: {e} (the original is kept)", sc.display()))
+            copy_verified(&sc, &sc_dst, None).map(|()| true).map_err(|e| format!("move {}: {e} (the original is kept)", sc.display()))
         };
         match r {
-            Ok(created) => placed.sidecars.push(PlacedSidecar { src: sc, dst: sc_dst, created, stem: stem_named }),
+            Ok(_) => placed.sidecars.push(sc_dst),
             Err(e) => {
                 rollback(&placed);
-                return Err(e);
+                return Err(format!("{e}; the placed copy at {} remains for recovery", placed.dst.display()));
             }
         }
     }
@@ -171,7 +169,7 @@ pub(crate) fn place(src: &Path, dir: &Path, name: &str) -> Result<Placed, String
 
 /// Import → **Copy**: copy `src` into `dir` as `name` (-1, -2… when taken) with the same checks as
 /// a move's copy — a new file (never overwriting one, even one that appears meanwhile), synced to
-/// disk and verified; a bad copy is removed and reported, so a card is never wiped on the strength
+/// disk and verified; a bad copy is retained and reported, so a card is never wiped on the strength
 /// of it. Returns the new path.
 ///
 /// `expect` is the content hash the import's probe computed from its full read of the source
@@ -196,47 +194,21 @@ pub(crate) fn copy_new(src: &Path, dir: &Path, name: &str, expect: Option<lightc
     Err(format!("copy {}: no free name in {}", src.display(), dir.display()))
 }
 
-/// Undo a [`place`]: remove what it created at the destination (the sources were never touched).
+/// Abandon an uncommitted [`place`]. Leave its independently created destinations for recovery:
+/// the paths may have been replaced since placement, so removing them could delete other media.
 pub(crate) fn rollback(p: &Placed) {
-    for sc in p.sidecars.iter().filter(|s| s.created) {
-        let _ = fs::remove_file(&sc.dst);
-    }
-    let _ = fs::remove_file(&p.dst);
+    log::warn!("uncommitted Move copy retained for recovery at {}", p.dst.display());
 }
 
-/// Remove a placed photo's source (its catalog record is committed and saved): only when the
-/// destination is still there with the same size. Then its sidecars, unless another photo still
-/// uses a shared one. `Err` = the source was kept (why); `Ok` lists sidecars kept (path, why).
-pub(crate) fn finish(p: &Placed) -> Result<Vec<(String, String)>, String> {
-    let same = match (fs::metadata(&p.src), fs::metadata(&p.dst)) {
-        (Ok(s), Ok(d)) => s.is_file() && d.is_file() && s.len() == d.len(),
-        _ => false,
-    };
+/// Check the placed media after catalog persistence. The source and its sidecars remain at their
+/// original paths even on success: safe standard APIs cannot compare and unlink the same file
+/// atomically when another process might replace its path.
+pub(crate) fn finish(p: &Placed) -> Result<(), String> {
+    let same = hash_file(&p.src).is_ok_and(|h| h == p.hash) && hash_file(&p.dst).is_ok_and(|h| h == p.hash);
     if !same {
-        return Err(format!("{} is missing or changed: the original is kept", p.dst.display()));
+        return Err(format!("{} or {} is missing or changed: the original is kept", p.src.display(), p.dst.display()));
     }
-    if injected(Fault::FailRemove) {
-        return Err("could not remove the original (injected): it stays where it was".into());
-    }
-    fs::remove_file(&p.src).map_err(|e| format!("could not remove the original ({e}): it stays where it was"))?;
-    let mut kept = Vec::new();
-    for sc in &p.sidecars {
-        let path = sc.src.to_string_lossy().to_string();
-        if !same_bytes(&sc.src, &sc.dst).unwrap_or(false) {
-            kept.push((path, format!("{} is missing or changed: the sidecar is kept", sc.dst.display())));
-            continue;
-        }
-        if sc.stem
-            && let Some(other) = sibling_photo(&sc.src)
-        {
-            kept.push((path, format!("also the sidecar of {other}: kept beside it")));
-            continue;
-        }
-        if let Err(e) = fs::remove_file(&sc.src) {
-            kept.push((path, format!("could not remove the sidecar ({e})")));
-        }
-    }
-    Ok(kept)
+    Ok(())
 }
 
 /// A photo (by extension) still beside a stem-named sidecar, sharing its stem.
@@ -249,32 +221,9 @@ pub(crate) fn sibling_photo(sidecar: &Path) -> Option<String> {
     })
 }
 
-/// `dst` = `src` without touching `src`: a hard link, else a verified copy. Never overwrites
-/// (`AlreadyExists` when `dst` is taken).
-fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
-    let force_copy = injected(Fault::NoLink) || injected(Fault::FailWrite) || injected(Fault::Corrupt);
-    if !force_copy && !is_symlink(src) {
-        match fs::hard_link(src, dst) {
-            Ok(()) => {
-                let (a, b) = (fs::metadata(src)?, fs::metadata(dst)?);
-                if a.len() == b.len() {
-                    return Ok(());
-                }
-                let _ = fs::remove_file(dst);
-                return Err(io::Error::other("the link doesn't match the original"));
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
-            // another volume, or no hard links there (FAT/exFAT cards, some shares): copy
-            Err(_) => {}
-        }
-    }
-    // Move keeps the byte-for-byte comparison: the source is deleted on the strength of it
-    copy_verified(src, dst, None)
-}
-
 /// Copy into a new file, sync it to disk and verify it: against `expect` (the probe's hash of the
-/// source) when given, else byte for byte against the source. On any failure the partial copy is
-/// removed.
+/// source) when given, else byte for byte against the source. On failure the created destination
+/// is retained for recovery because another process may have replaced that path meanwhile.
 pub(crate) fn copy_verified(src: &Path, dst: &Path, expect: Option<lightcraft_preview::Hash128>) -> io::Result<()> {
     let mut out = OpenOptions::new().write(true).create_new(true).open(dst)?;
     let r = (|| {
@@ -301,10 +250,7 @@ pub(crate) fn copy_verified(src: &Path, dst: &Path, expect: Option<lightcraft_pr
         }
     })();
     drop(out);
-    if r.is_err() {
-        let _ = fs::remove_file(dst);
-    }
-    r
+    r.map_err(|e| io::Error::new(e.kind(), format!("{e}; unverified copy retained at {}", dst.display())))
 }
 
 /// [`lightcraft_preview::hash_bytes`] of a file's content, read in chunks.

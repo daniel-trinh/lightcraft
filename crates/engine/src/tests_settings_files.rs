@@ -89,9 +89,11 @@ fn unreadable_settings_are_not_overwritten() {
     assert!(warnings.iter().all(|w| w.contains("couldn't be read") && w.contains("won't overwrite")), "{warnings:?}");
 
     // a preset change and a preference change: neither file is replaced by defaults
-    s.execute("preset.create", &json!({"name": "New"})).unwrap();
+    assert!(matches!(s.execute("preset.create", &json!({"name": "New"})), Err(crate::EngineError::NotSaved(_))));
     let e = s.execute("library.preferences", &json!({"cacheMb": 300}));
     assert!(e.is_err(), "saving preferences is refused, not done over the unread file");
     assert_eq!(files.files.get("presets.json").unwrap(), presets);
     assert_eq!(files.files.get("prefs.json").unwrap(), prefs);
+    assert!(s.unsaved().is_some(), "the in-memory settings must be reported as unsaved");
+    assert!(matches!(s.close_library(), Err(crate::EngineError::NotSaved(_))));
 }

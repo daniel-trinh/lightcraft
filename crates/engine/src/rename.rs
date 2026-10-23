@@ -315,7 +315,6 @@ pub(crate) trait MoveFs {
     fn rename_no_replace(&self, a: &Path, b: &Path) -> std::io::Result<()>;
     /// Copy `a` to a new file `b` (an independent copy, never a link), failing when `b` exists.
     fn copy_no_replace(&self, a: &Path, b: &Path) -> std::io::Result<()>;
-    fn remove_file(&self, p: &Path) -> std::io::Result<()>;
     /// Another photo file beside the stem-named sidecar `sidecar` that shares its stem (e.g.
     /// `IMG_1.JPG` for `IMG_1.xmp`), which still uses that sidecar.
     fn stem_sibling(&self, sidecar: &Path) -> Option<String>;
@@ -358,33 +357,16 @@ impl MoveFs for RealFs {
     }
 
     fn rename_no_replace(&self, a: &Path, b: &Path) -> std::io::Result<()> {
-        if self.exists(b) {
-            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} already exists", b.display())));
-        }
-        // A hard link fails when `b` exists — even if it appeared since the check above — so
-        // nothing is ever replaced. Volumes without hard links (FAT, some network shares) fall back
-        // to a plain rename after the check.
-        match std::fs::hard_link(a, b) {
-            Ok(()) => std::fs::remove_file(a).inspect_err(|_| {
-                // both names are the same file: dropping the new one loses nothing
-                let _ = std::fs::remove_file(b);
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-            Err(_) => std::fs::rename(a, b),
-        }
+        lightcraft_sysfs::rename_no_replace(a, b)
     }
 
     fn copy_no_replace(&self, a: &Path, b: &Path) -> std::io::Result<()> {
         use std::io::Write;
         let bytes = std::fs::read(a)?;
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(b)?;
-        f.write_all(&bytes).and_then(|_| f.sync_all()).inspect_err(|_| {
-            let _ = std::fs::remove_file(b);
-        })
-    }
-
-    fn remove_file(&self, p: &Path) -> std::io::Result<()> {
-        std::fs::remove_file(p)
+        f.write_all(&bytes)
+            .and_then(|_| f.sync_all())
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{e}; incomplete sidecar copy retained at {}", b.display())))
     }
 
     fn stem_sibling(&self, sidecar: &Path) -> Option<String> {
@@ -485,8 +467,9 @@ pub(crate) fn move_file_with(fs: &dyn MoveFs, from: &str, to: &str) -> std::resu
             }
             for (a, b, copied) in done.iter().rev() {
                 if *copied {
-                    // the original is still there: the copy just goes (a leftover copy loses nothing)
-                    let _ = fs.remove_file(b);
+                    // A replacement may now answer to `b`; retain the copy rather than
+                    // deleting that path during rollback.
+                    message.push_str(&format!("; sidecar copy {} retained for recovery", b.display()));
                 } else if let Err(e) = move_one(fs, b, a) {
                     message.push_str(&format!("; sidecar {} could not be moved back ({e}): it is now {}", a.display(), b.display()));
                 }
@@ -820,11 +803,6 @@ mod tests {
             self.files.borrow_mut().push((Self::norm(b), c));
             Ok(())
         }
-        fn remove_file(&self, p: &Path) -> std::io::Result<()> {
-            let i = self.idx(p).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;
-            self.files.borrow_mut().remove(i);
-            Ok(())
-        }
         fn stem_sibling(&self, sidecar: &Path) -> Option<String> {
             let stem = Self::norm(&sidecar.with_extension(""));
             self.files.borrow().iter().map(|(f, _)| f.clone()).find(|f| {
@@ -1001,12 +979,13 @@ mod tests {
         move_file_with(&fs, "/p/IMG_1.JPG", "/p/Trip_2.JPG").unwrap();
         assert!(fs.listing().contains(&("/p/Trip_2.xmp".into(), "shared".into())));
         assert!(!fs.exists(Path::new("/p/IMG_1.xmp")));
-        // a failure after the copy removes the copy and keeps the original
+        // a failure after the copy retains both for recovery
         let fs = FakeFs::new(false, &[("/p/A.CR3", "raw"), ("/p/A.JPG", "jpg"), ("/p/A.xmp", "shared"), ("/p/A.CR3.xmp", "own")]);
         fs.fail.borrow_mut().push("A.CR3.xmp".into());
-        assert!(move_file_with(&fs, "/p/A.CR3", "/p/B.CR3").is_err());
-        assert_eq!(fs.listing().len(), 4);
-        assert!(fs.listing().contains(&("/p/A.xmp".into(), "shared".into())) && !fs.exists(Path::new("/p/B.xmp")));
+        let e = move_file_with(&fs, "/p/A.CR3", "/p/B.CR3").unwrap_err();
+        assert!(e.message.contains("retained for recovery"), "{e}");
+        assert_eq!(fs.listing().len(), 5);
+        assert!(fs.listing().contains(&("/p/A.xmp".into(), "shared".into())) && fs.exists(Path::new("/p/B.xmp")));
     }
 
     /// Issue #95 on the real disk, whichever kind of volume the temp folder is on.

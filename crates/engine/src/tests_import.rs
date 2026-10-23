@@ -590,6 +590,26 @@ fn folders_rename_and_move_with_their_photos() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn case_only_folder_rename_never_replaces_a_distinct_directory() {
+    let root = temp_dir("folder-case-collision");
+    let upper = root.join("Trip");
+    let lower = root.join("trip");
+    std::fs::create_dir_all(&upper).unwrap();
+    std::fs::write(upper.join("photo.txt"), b"original").unwrap();
+    if !lower.exists() {
+        std::fs::create_dir(&lower).unwrap();
+        let err = crate::cmd::browse::rename_folder_on_disk(&upper.to_string_lossy(), &lower.to_string_lossy()).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read(upper.join("photo.txt")).unwrap(), b"original");
+        assert!(lower.is_dir(), "the distinct empty folder must survive");
+    } else {
+        crate::cmd::browse::rename_folder_on_disk(&upper.to_string_lossy(), &lower.to_string_lossy()).unwrap();
+        assert_eq!(std::fs::read(lower.join("photo.txt")).unwrap(), b"original");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Rename / Move Folder are undo steps (issue #97): undo renames the folder back on disk (files and
 /// sidecars along) and restores the photos' paths, redo repeats it; a destination taken in the
 /// meantime is never overwritten — the step is refused, reported and stays on the stack.
@@ -785,6 +805,11 @@ fn smart_previews_folder_is_chosen_per_library() {
     s.execute("library.smartPreviews", &json!({})).unwrap();
     assert_eq!(crate::smart::stats(&lib.join("Smart Previews")).0, 1);
 
+    // A differently spelled path to the same folder must not remove the only proxy.
+    let alias = lib.join("Smart Previews/../Smart Previews");
+    s.execute("library.smartPreviewsLocation", &json!({"path": alias, "existing": "move"})).unwrap();
+    assert_eq!(crate::smart::stats(&lib.join("Smart Previews")).0, 1);
+
     // relative paths and missing drives are refused, and nothing is created on this drive
     assert!(s.execute("library.smartPreviewsLocation", &json!({"path": "rel/dir"})).is_err());
     let gone = away.join("unplugged/previews");
@@ -799,7 +824,7 @@ fn smart_previews_folder_is_chosen_per_library() {
 
     let r = s.execute("library.smartPreviewsLocation", &json!({"path": to.to_string_lossy(), "existing": "move"})).unwrap();
     assert_eq!((r["custom"].clone(), r["handled"].clone(), r["count"].clone()), (json!(true), json!(1), json!(1)), "{r}");
-    assert_eq!(crate::smart::stats(&lib.join("Smart Previews")).0, 0);
+    assert_eq!(crate::smart::stats(&lib.join("Smart Previews")).0, 1, "recovery copy retained");
     assert_eq!(s.execute("photo.smartPreview", &json!({})).unwrap()["smartPreview"], true);
 
     // the setting is saved with the library
@@ -829,6 +854,27 @@ fn smart_previews_folder_is_chosen_per_library() {
     let r = again.execute("library.smartPreviewsLocation", &json!({"reset": true})).unwrap();
     assert_eq!(r["custom"], false, "{r}");
     assert_eq!(r["path"], lib.join("Smart Previews").to_string_lossy().as_ref());
+}
+
+#[test]
+fn smart_preview_preference_failure_keeps_old_folder_and_all_copies() {
+    let src = temp_dir("smart-save-src");
+    let lib = temp_dir("smart-save-lib");
+    let to = temp_dir("smart-save-to");
+    write_png(&src.join("a.png"), 7);
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    s.execute("library.import", &json!({"paths": [src.join("a.png")]})).unwrap();
+    s.execute("library.smartPreviews", &json!({})).unwrap();
+    s.save_prefs().unwrap();
+    let prefs = lib.join("prefs.json");
+    std::fs::remove_file(&prefs).unwrap();
+    std::fs::create_dir(&prefs).unwrap(); // Force a preference replacement error on every OS.
+    assert!(s.execute("library.smartPreviewsLocation", &json!({"path": to, "existing": "move"})).is_err());
+    assert_eq!(s.media.smart_dir, Some(lib.join("Smart Previews")));
+    assert!(s.smart_previews_dir.is_none());
+    assert_eq!(crate::smart::stats(&lib.join("Smart Previews")).0, 1);
+    assert_eq!(crate::smart::stats(&to).0, 1);
 }
 
 /// Missing Photos covers library photos only: a small library next to many Local browse

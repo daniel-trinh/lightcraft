@@ -120,7 +120,7 @@ fn path_writes_never_replace_an_original() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The `import` helper moves: renamed into the folder template, the source removed.
+/// The `import` helper's Move mode makes a renamed copy and retains the source.
 #[test]
 fn import_tool_moves_with_a_folder_template() {
     let base = std::env::temp_dir().join(format!("lc-mcp-import-move-{}", std::process::id()));
@@ -137,7 +137,7 @@ fn import_tool_moves_with_a_folder_template() {
     let r = call_tool(&mut b, "import", &args);
     assert!(!r.is_error, "{r:?}");
     assert!(dest.join("2026").join("20260114").join("20260114_001.png").is_file());
-    assert!(!src.join("sample.png").exists(), "moved");
+    assert!(src.join("sample.png").exists(), "original retained");
     let _ = std::fs::remove_dir_all(&base);
 }
 

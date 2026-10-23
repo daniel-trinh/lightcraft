@@ -95,7 +95,12 @@ pub fn check_writable(dir: &Path) -> Result<(), String> {
         std::fs::create_dir(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
     }
     let probe = dir.join(format!(".lightcraft-write-test-{}", std::process::id()));
-    std::fs::write(&probe, b"x").map_err(|e| format!("{} is not writable (is the drive full or read-only?): {e}", dir.display()))?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|e| format!("{}: cannot exclusively create write probe (drive full, read-only, or probe already exists): {e}", dir.display()))?;
+    drop(file);
     let _ = std::fs::remove_file(&probe);
     Ok(())
 }
@@ -111,11 +116,11 @@ pub fn stats(dir: &Path) -> (usize, u64) {
 /// What to do with the smart previews in the old folder when the location changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Existing {
-    /// Move them to the new folder (copy and delete across drives).
+    /// Copy them to the new folder, retaining the old copies for recovery.
     Move,
     /// Leave them where they are (they stop being used; build again in the new folder).
     Leave,
-    /// Delete them.
+    /// Legacy spelling: retain old copies, like Leave. Relocation never deletes files.
     Discard,
 }
 
@@ -130,38 +135,72 @@ impl Existing {
     }
 }
 
-/// Apply `what` to the smart previews in `from` for the new folder `to` → (moved or removed, failed).
+/// Apply `what` to the smart previews in `from` for the new folder `to` → (copied or removed, failed).
+/// Relocation retains old copies: a comparison followed by unlink cannot safely identify a file
+/// another writer may have replaced. Legacy Discard also retains files: the folder may be shared.
 pub fn migrate(from: &Path, to: &Path, what: Existing) -> (usize, Vec<String>) {
     let (mut done, mut failed) = (0, Vec::new());
-    if what == Existing::Leave {
+    if what != Existing::Move || same_directory(from, to) {
         return (done, failed);
     }
     let Ok(rd) = std::fs::read_dir(from) else { return (done, failed) };
     for e in rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "lcsp")) {
         let src = e.path();
-        let r = match what {
-            Existing::Discard => std::fs::remove_file(&src),
-            _ => {
-                let dst = to.join(e.file_name());
-                if is_valid(&dst) {
-                    // named by content: the complete copy already there is the same preview
-                    std::fs::remove_file(&src)
+        let dst = to.join(e.file_name());
+        let r = std::fs::read(&src).and_then(|bytes| match lightcraft_catalog::safe_file::write_new(&dst, &bytes) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&dst)? == bytes {
+                    Ok(())
                 } else {
-                    // across drives: copied atomically (never a partial proxy at the new place)
-                    std::fs::rename(&src, &dst).or_else(|_| {
-                        std::fs::read(&src)
-                            .and_then(|b| lightcraft_catalog::safe_file::write_atomic(&dst, &b))
-                            .and_then(|()| std::fs::remove_file(&src))
-                    })
+                    Err(e)
                 }
             }
-        };
+            result => result,
+        });
         match r {
             Ok(()) => done += 1,
             Err(err) => failed.push(format!("{}: {err}", src.display())),
         }
     }
     (done, failed)
+}
+
+/// Resolve directory aliases before any migration, including explicit discard.
+pub fn same_directory(a: &Path, b: &Path) -> bool {
+    a == b || lightcraft_catalog::safe_file::same_file(a, b)
+}
+
+/// Remove a proxy from active use without permanently deleting its bytes. The OS performs one
+/// exclusive rename; a concurrent replacement is retained at the recovery path too.
+pub fn discard_recoverably(path: &Path) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().ok_or_else(|| std::io::Error::other("preview has no parent folder"))?;
+    let recovery = parent.join(".lightcraft-preview-recovery");
+    // Create only this level: never recreate a missing custom drive/mount while discarding.
+    match std::fs::create_dir(&recovery) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::symlink_metadata(&recovery)?;
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Err(std::io::Error::other("preview recovery path is not a regular directory"));
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    let name = path.file_name().ok_or_else(|| std::io::Error::other("preview has no file name"))?.to_string_lossy();
+    for _ in 0..1000 {
+        let dst = recovery.join(format!("{}-{}-{name}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        match lightcraft_sysfs::rename_no_replace(path, &dst) {
+            Ok(()) => {
+                log::info!("discarded smart preview retained at {}", dst.display());
+                return Ok(dst);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free preview recovery name"))
 }
 
 /// A cheap check that the smart preview at `path` is complete: our header, then a JPEG from its
@@ -197,6 +236,20 @@ pub fn load(path: &Path) -> Result<crate::media::DecodedSource, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_discard_retains_proxy_bytes_and_other_files() {
+        let dir = temp("discard-recovery");
+        let proxy = dir.join("selected.lcsp");
+        let other = dir.join("other-library.lcsp");
+        std::fs::write(&proxy, b"only offline copy").unwrap();
+        std::fs::write(&other, b"another library").unwrap();
+        let kept = discard_recoverably(&proxy).unwrap();
+        assert!(!proxy.exists());
+        assert_eq!(std::fs::read(kept).unwrap(), b"only offline copy");
+        assert_eq!(std::fs::read(other).unwrap(), b"another library");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn temp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("lc-smart-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -227,10 +280,10 @@ mod tests {
         assert_eq!(migrate(&a, &b, Existing::Leave).0, 0);
         assert_eq!(stats(&a).0, 1);
         assert_eq!(migrate(&a, &b, Existing::Move).0, 1);
-        assert_eq!((stats(&a).0, stats(&b).0), (0, 1));
+        assert_eq!((stats(&a).0, stats(&b).0), (1, 1));
         assert!(a.join("note.txt").exists(), "only smart previews are touched");
-        assert_eq!(migrate(&b, &a, Existing::Discard).0, 1);
-        assert_eq!(stats(&b).0, 0);
+        assert_eq!(migrate(&b, &a, Existing::Discard).0, 0);
+        assert_eq!(stats(&b).0, 1, "legacy discard cannot delete another library's proxies");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -249,10 +302,26 @@ mod tests {
             assert!(!is_valid(&b.join("1.lcsp")), "cut at {cut}");
         }
         assert!(!is_valid(&b.join("missing.lcsp")));
-        // moving onto a damaged copy replaces it instead of deleting the good one
-        assert_eq!(migrate(&a, &b, Existing::Move).0, 1);
-        assert_eq!(std::fs::read(b.join("1.lcsp")).unwrap(), good);
+        // A conflicting file is preserved for inspection, and the good source remains intact.
+        let (copied, failed) = migrate(&a, &b, Existing::Move);
+        assert_eq!(copied, 0);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(std::fs::read(a.join("1.lcsp")).unwrap(), good);
+        assert_eq!(std::fs::read(b.join("1.lcsp")).unwrap(), b"");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn directory_alias_never_deletes_a_preview() {
+        let base = temp("alias");
+        std::fs::create_dir(base.join("sub")).unwrap();
+        let path = base.join("only.lcsp");
+        std::fs::write(&path, b"only copy").unwrap();
+        for mode in [Existing::Move, Existing::Discard] {
+            assert_eq!(migrate(&base, &base.join("sub/.."), mode), (0, vec![]));
+            assert_eq!(std::fs::read(&path).unwrap(), b"only copy");
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

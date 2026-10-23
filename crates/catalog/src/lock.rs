@@ -13,9 +13,8 @@
 //! - Who holds it (process id, computer, program, version) is written to `catalog.lock.owner`, for
 //!   the error message. It's a separate file because a Windows lock also blocks reading the
 //!   locked file. It's only a hint: it may be missing or left over from a crash.
-//! - File systems without lock support (some network shares): the library opens unlocked, with a
-//!   warning — refusing it would lock the user out of their own library. Locks over SMB/NFS are
-//!   advisory and depend on the server; the owner file is then the only hint.
+//! - File systems without lock support (some network shares) are refused: opening without an
+//!   exclusive lock would let two writers silently overwrite one another's catalog.
 //! - Browser storage (OPFS) has no file locks: see the web host for its own guard.
 
 use std::fs::{File, OpenOptions, TryLockError};
@@ -79,6 +78,8 @@ pub enum LockError {
     /// Another process has the library open.
     #[error("This library is already open in {}. Close it there first.", .0.as_ref().map(LockOwner::describe).unwrap_or_else(|| "another LightCraft program".into()))]
     InUse(Option<LockOwner>),
+    #[error("Cannot exclusively lock this library: {0}. Move it to a file system that supports locks or fix access to catalog.lock.")]
+    Unavailable(io::Error),
 }
 
 /// The exclusive lock on a library directory; released on drop (and by the OS if the process
@@ -86,21 +87,15 @@ pub enum LockError {
 #[derive(Debug)]
 pub struct LibraryLock {
     dir: PathBuf,
-    /// `None` when the file system can't lock (the library is open unlocked).
-    _file: Option<File>,
-    held: bool,
+    _file: File,
 }
 
 impl LibraryLock {
-    /// Lock `dir` (which must exist) for this process. Fails only when another process holds it.
+    /// Lock `dir` (which must exist) for this process. Refuse any lock failure.
     pub fn acquire(dir: &Path, program: &str) -> Result<LibraryLock, LockError> {
-        let unlocked = |why: io::Error| {
-            log::warn!("library {}: can't lock {LOCK} ({why}); opening it without protection against a second program", dir.display());
-            LibraryLock { dir: dir.to_path_buf(), _file: None, held: false }
-        };
         let file = match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(LOCK)) {
             Ok(f) => f,
-            Err(e) => return Ok(unlocked(e)),
+            Err(e) => return Err(LockError::Unavailable(e)),
         };
         match file.try_lock() {
             Ok(()) => {}
@@ -108,7 +103,7 @@ impl LibraryLock {
                 let owner = std::fs::read(dir.join(OWNER)).ok().and_then(|b| serde_json::from_slice::<LockOwner>(&b).ok());
                 return Err(LockError::InUse(owner));
             }
-            Err(TryLockError::Error(e)) => return Ok(unlocked(e)),
+            Err(TryLockError::Error(e)) => return Err(LockError::Unavailable(e)),
         }
         let owner = LockOwner::this_process(program);
         if let Ok(json) = serde_json::to_vec_pretty(&owner)
@@ -116,12 +111,12 @@ impl LibraryLock {
         {
             log::warn!("library {}: can't write {OWNER}: {e}", dir.display());
         }
-        Ok(LibraryLock { dir: dir.to_path_buf(), _file: Some(file), held: true })
+        Ok(LibraryLock { dir: dir.to_path_buf(), _file: file })
     }
 
-    /// The OS lock is held (`false`: the file system can't lock; opened unprotected).
+    /// The OS lock is held.
     pub fn held(&self) -> bool {
-        self.held
+        true
     }
 
     pub fn dir(&self) -> &Path {
@@ -133,8 +128,6 @@ impl Drop for LibraryLock {
     /// Remove the owner note while still holding the lock (so it can't delete the next holder's),
     /// then the file handle closes and the OS releases the lock.
     fn drop(&mut self) {
-        if self.held {
-            let _ = std::fs::remove_file(self.dir.join(OWNER));
-        }
+        let _ = std::fs::remove_file(self.dir.join(OWNER));
     }
 }

@@ -1,12 +1,12 @@
-//! Import → Move: files (and their sidecars) end up at the destination, and a source is removed
-//! only when its move fully succeeded. Temp dirs only.
+//! Import → Move: verified copies (and sidecars) end up at the destination while originals stay
+//! at the source. Temp dirs only.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use crate::Session;
-use crate::import_move::{Fault, inject};
+use crate::import_move::{Fault, finish, inject, place};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("lc-move-{tag}-{}", std::process::id()));
@@ -80,7 +80,32 @@ fn files_under(d: &Path) -> Vec<String> {
     out
 }
 
-/// Same volume: renamed into the folder template, sidecars (both namings) along, sources gone,
+#[test]
+fn move_refuses_same_size_source_or_destination_replacement() {
+    let base = temp_dir("replacement");
+    let source = base.join("card/a.bin");
+    let destination = base.join("out");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"original").unwrap();
+    let first = place(&source, &destination, "a.bin").unwrap();
+    assert_eq!(std::fs::read(&first.dst).unwrap(), b"original");
+
+    // The source path can be replaced between preparation and the saved-catalog finish.
+    std::fs::write(&source, b"new data").unwrap();
+    assert_eq!(std::fs::read(&first.dst).unwrap(), b"original", "placement must not hard-link mutable source bytes");
+    assert!(finish(&first).is_err());
+    assert_eq!(std::fs::read(&source).unwrap(), b"new data");
+
+    // A same-length destination replacement must not authorize deleting the original either.
+    std::fs::write(&source, b"original").unwrap();
+    let second = place(&source, &destination, "a.bin").unwrap();
+    std::fs::write(&second.dst, b"bad copy").unwrap();
+    assert!(finish(&second).is_err());
+    assert_eq!(std::fs::read(&source).unwrap(), b"original");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Same volume: copied into the folder template, sidecars (both namings) along, sources retained,
 /// the catalog points at the new files; undo forgets the photos but leaves the files.
 #[test]
 fn move_into_a_folder_template_with_sidecars() {
@@ -94,30 +119,30 @@ fn move_into_a_folder_template_with_sidecars() {
     let mut s = session();
     let r = import_move(&mut s, &[&card], &dest, json!({"organize": "{date:%Y}/{date:%Y%m%d}", "rename": "{date:%Y%m%d}_{seq:3}"}));
     assert_eq!(len(&r, "imported"), 2, "{r}");
-    assert_eq!(len(&r, "moved"), 2, "{r}");
-    assert_eq!(len(&r, "kept"), 0, "{r}");
+    assert_eq!(len(&r, "moved"), 0, "{r}");
+    assert_eq!(len(&r, "kept"), 2, "{r}");
     assert_eq!(
         files_under(&dest),
         ["2026/20260114/20260114_001.png", "2026/20260114/20260114_001.xmp", "2026/20260114/20260114_002.png", "2026/20260114/20260114_002.png.xmp"]
     );
-    assert_eq!(files_under(&card), Vec::<String>::new(), "the card is empty");
+    assert_eq!(files_under(&card), ["a.png", "a.xmp", "b.png", "b.png.xmp"]);
     assert_eq!(std::fs::read(dest.join("2026/20260114/20260114_001.png")).unwrap(), a_bytes);
     let day = dest.join("2026").join("20260114");
     assert_eq!(photo_paths(&s), [day.join("20260114_001.png").to_string_lossy(), day.join("20260114_002.png").to_string_lossy()]);
     let mut ratings: Vec<u8> = s.catalog.photos().map(|p| p.rating).collect();
     ratings.sort();
     assert_eq!(ratings, [3, 4], "the sidecars were read");
-    assert_eq!(r["moved"][0]["sidecars"][0], day.join("20260114_001.xmp").to_string_lossy().as_ref());
-    // undo: the photos leave the library, the moved files stay where they are now
+    assert_eq!(r["kept"][0]["path"], card.join("a.png").to_string_lossy().as_ref());
+    // undo: the photos leave the library; copies and originals stay where they are
     s.execute("edit.undo", &json!({})).unwrap();
     assert_eq!(s.catalog.len(), 0);
     assert_eq!(files_under(&dest).len(), 4);
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Another volume (no hard links): copied, verified and only then the source removed.
+/// Another volume: copied and verified while the source remains recoverable.
 #[test]
-fn move_across_volumes_copies_then_removes() {
+fn move_across_volumes_copies_and_keeps_source() {
     let base = temp_dir("xvol");
     let (card, dest) = (base.join("card"), base.join("out"));
     write_png(&card.join("a.png"), 1);
@@ -127,7 +152,8 @@ fn move_across_volumes_copies_then_removes() {
     inject(Fault::NoLink);
     let r = import_move(&mut s, &[&card], &dest, json!({"organize": "flat"}));
     inject(Fault::None);
-    assert_eq!(len(&r, "moved"), 1, "{r}");
+    assert_eq!(len(&r, "moved"), 0, "{r}");
+    assert_eq!(len(&r, "kept"), 1, "{r}");
     assert_eq!(files_under(&dest), ["a.png", "a.xmp"]);
     assert_eq!(std::fs::read(dest.join("a.png")).unwrap(), bytes);
     #[cfg(unix)]
@@ -135,12 +161,12 @@ fn move_across_volumes_copies_then_removes() {
         use std::os::unix::fs::MetadataExt;
         assert_eq!(std::fs::metadata(dest.join("a.png")).unwrap().nlink(), 1, "a real copy, not a link");
     }
-    assert!(!card.join("a.png").exists() && !card.join("a.xmp").exists());
+    assert!(card.join("a.png").exists() && card.join("a.xmp").exists());
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A copy that fails while writing, or comes out different, leaves nothing behind and keeps the
-/// source; nothing is catalogued.
+/// A copy that fails while writing, or comes out different, keeps the source and leaves its
+/// unverified destination for recovery; nothing is catalogued.
 #[test]
 fn a_failed_or_corrupt_copy_keeps_the_source() {
     for fault in [Fault::FailWrite, Fault::Corrupt] {
@@ -158,14 +184,15 @@ fn a_failed_or_corrupt_copy_keeps_the_source() {
         assert_eq!(s.catalog.len(), 0);
         assert_eq!(std::fs::read(card.join("a.png")).unwrap(), bytes, "{fault:?}: source intact");
         assert!(card.join("a.xmp").is_file());
-        assert_eq!(files_under(&dest), Vec::<String>::new(), "{fault:?}: no partial copy left");
+        assert_eq!(files_under(&dest), ["a.png"], "{fault:?}: unverified copy retained");
+        assert!(r.to_string().contains("unverified copy retained"), "{r}");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
 
 /// Issue #96: Import → Copy used a plain unverified copy (and check-then-copy naming that could
 /// replace a file). It now gets the same verified copy as Move: a copy that fails or comes out
-/// different is removed and reported as a failed import, nothing is catalogued, and the card
+/// different is retained and reported as a failed import, nothing is catalogued, and the card
 /// is untouched; a good copy never replaces an existing file.
 #[test]
 fn copy_import_verifies_each_copy() {
@@ -190,7 +217,7 @@ fn copy_import_verifies_each_copy() {
         assert!(r.to_string().contains("the original is untouched"), "{r}");
         assert_eq!(s.catalog.len(), 0);
         assert_eq!(std::fs::read(card.join("a.png")).unwrap(), bytes, "{fault:?}: source intact");
-        assert_eq!(files_under(&dest), Vec::<String>::new(), "{fault:?}: no bad copy left");
+        assert_eq!(files_under(&dest), ["a.png"], "{fault:?}: bad copy retained for recovery");
         let _ = std::fs::remove_dir_all(&base);
     }
     // a good copy: verified, and a taken name gets -1 instead of being replaced
@@ -225,19 +252,19 @@ fn copy_is_verified_against_the_probe_hash() {
     let stale = lightcraft_preview::hash_bytes(b"what the probe read earlier");
     let e = copy_verified(&src, &base.join("stale.bin"), Some(stale)).unwrap_err();
     assert!(e.to_string().contains("differs"), "{e}");
-    assert!(!base.join("stale.bin").exists(), "the refused copy is removed");
+    assert!(base.join("stale.bin").exists(), "the refused copy is retained for recovery");
     // a copy that comes out different: caught by the hash
     inject(Fault::Corrupt);
     let r = copy_verified(&src, &base.join("bad.bin"), Some(good));
     inject(Fault::None);
     assert!(r.is_err());
-    assert!(!base.join("bad.bin").exists());
+    assert!(base.join("bad.bin").exists());
     assert_eq!(std::fs::read(&src).unwrap(), bytes, "the source is untouched");
     let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A file replaced after Review Import probed it is not imported on the strength of the old probe:
-/// its copy no longer matches the probe's hash, so it's reported as failed and nothing is left.
+/// its copy no longer matches the probe's hash, so it is reported as failed and retained for recovery.
 #[test]
 fn copy_import_refuses_a_file_changed_since_the_review() {
     let base = temp_dir("copychanged");
@@ -256,7 +283,7 @@ fn copy_import_refuses_a_file_changed_since_the_review() {
     assert_eq!(len(&r, "imported"), 0, "{r}");
     assert_eq!(len(&r, "failed"), 1, "{r}");
     assert!(r.to_string().contains("changed meanwhile"), "{r}");
-    assert_eq!(files_under(&dest), Vec::<String>::new());
+    assert_eq!(files_under(&dest), ["a.png"]);
     // importing again probes afresh and succeeds
     let r = s
         .execute(
@@ -268,28 +295,25 @@ fn copy_import_refuses_a_file_changed_since_the_review() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A source that can't be removed (a read-only card) stays and is reported; the photo is
-/// imported from its copy.
+/// A source stays and is reported even when deletion would have been possible.
 #[test]
-fn a_source_that_cannot_be_removed_is_kept_and_reported() {
+fn a_source_is_kept_and_reported() {
     let base = temp_dir("ro");
     let (card, dest) = (base.join("card"), base.join("out"));
     write_png(&card.join("a.png"), 1);
     let mut s = session();
-    inject(Fault::FailRemove);
     let r = import_move(&mut s, &[&card], &dest, json!({"organize": "flat"}));
-    inject(Fault::None);
     assert_eq!(len(&r, "imported"), 1, "{r}");
     assert_eq!(len(&r, "moved"), 0, "{r}");
     assert_eq!(len(&r, "kept"), 1, "{r}");
-    assert!(r["kept"][0]["reason"].as_str().unwrap().contains("could not remove"), "{r}");
+    assert!(r["kept"][0]["reason"].as_str().unwrap().contains("remain at the source"), "{r}");
     assert!(card.join("a.png").is_file() && dest.join("a.png").is_file());
     assert_eq!(photo_paths(&s), [dest.join("a.png").to_string_lossy()]);
     let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Duplicates, unreadable files and files that fail (here: a different sidecar already at the
-/// destination) keep their sources; the rest of the batch still moves.
+/// destination) keep their sources; the rest of the batch is copied.
 #[test]
 fn duplicates_and_failures_keep_their_sources() {
     let base = temp_dir("dup");
@@ -308,10 +332,10 @@ fn duplicates_and_failures_keep_their_sources() {
     let r = import_move(&mut s, &[&card], &dest, json!({"organize": "flat"}));
     assert_eq!(len(&r, "duplicates"), 1, "{r}");
     assert_eq!(len(&r, "failed"), 2, "{r}"); // broken.jpg (unreadable) and a.png (sidecar clash)
-    assert_eq!(len(&r, "moved"), 1, "{r}");
-    assert_eq!(r["moved"][0]["from"], card.join("b.png").to_string_lossy().as_ref());
-    assert_eq!(files_under(&card), ["a.png", "a.xmp", "broken.jpg", "same.png"]);
-    assert_eq!(files_under(&dest), ["a.xmp", "b.png"], "a.png's copy was taken back");
+    assert_eq!(len(&r, "moved"), 0, "{r}");
+    assert_eq!(r["kept"][0]["path"], card.join("b.png").to_string_lossy().as_ref());
+    assert_eq!(files_under(&card), ["a.png", "a.xmp", "b.png", "broken.jpg", "same.png"]);
+    assert_eq!(files_under(&dest), ["a.png", "a.xmp", "b.png"], "a.png's uncommitted copy is retained");
     assert_eq!(std::fs::read_to_string(dest.join("a.xmp")).unwrap(), xmp(5), "never overwritten");
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -330,16 +354,15 @@ fn collisions_are_numbered_and_files_in_the_destination_stay() {
     let mut s = session();
     let r = import_move(&mut s, &[&card, &dest.join("inbox")], &dest, json!({"organize": "flat"}));
     assert_eq!(len(&r, "imported"), 2, "{r}");
-    assert_eq!(len(&r, "moved"), 1, "{r}");
-    assert_eq!(len(&r, "kept"), 1, "{r}");
+    assert_eq!(len(&r, "moved"), 0, "{r}");
+    assert_eq!(len(&r, "kept"), 2, "{r}");
     assert_eq!(files_under(&dest), ["a-1.png", "a-1.xmp", "a.png", "inbox/c.png"]);
     assert_eq!(std::fs::read(dest.join("a.png")).unwrap(), theirs);
     assert!(photo_paths(&s).contains(&dest.join("inbox").join("c.png").to_string_lossy().to_string()));
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A stem-named sidecar shared with a photo that isn't moved is copied along but stays beside
-/// that photo.
+/// A stem-named sidecar shared with another photo is copied and retained beside both originals.
 #[test]
 fn a_shared_sidecar_stays_with_the_photo_left_behind() {
     let base = temp_dir("shared");
@@ -349,17 +372,17 @@ fn a_shared_sidecar_stays_with_the_photo_left_behind() {
     std::fs::write(card.join("x.xmp"), xmp(2)).unwrap();
     let mut s = session();
     let r = import_move(&mut s, &[&card.join("x.png")], &dest, json!({"organize": "flat"}));
-    assert_eq!(len(&r, "moved"), 1, "{r}");
+    assert_eq!(len(&r, "moved"), 0, "{r}");
     assert_eq!(files_under(&dest), ["x.png", "x.xmp"]);
-    assert_eq!(files_under(&card), ["x.tif", "x.xmp"]);
-    assert!(r["kept"][0]["reason"].as_str().unwrap().contains("x.tif"), "{r}");
+    assert_eq!(files_under(&card), ["x.png", "x.tif", "x.xmp"]);
+    assert_eq!(len(&r, "kept"), 1, "{r}");
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Into the open library's Originals/ (default destination): the records are saved before the
-/// sources go, and are there after reopening. Move needs somewhere to go and never browses.
+/// Into the open library's Originals/ (default destination): the records are saved and are there
+/// after reopening; sources remain. Move needs somewhere to copy and never browses.
 #[test]
-fn move_into_the_library_is_saved_before_sources_go() {
+fn move_into_the_library_is_saved_while_sources_remain() {
     let base = temp_dir("lib");
     let (card, lib) = (base.join("card"), base.join("lib"));
     write_png(&card.join("a.png"), 1);
@@ -371,8 +394,8 @@ fn move_into_the_library_is_saved_before_sources_go() {
     assert!(card.join("a.png").is_file());
     s.open_library(&lib, false).unwrap();
     let r = s.execute("library.import", &p).unwrap();
-    assert_eq!(len(&r, "moved"), 1, "{r}");
-    assert!(!card.join("a.png").exists());
+    assert_eq!(len(&r, "moved"), 0, "{r}");
+    assert!(card.join("a.png").exists());
     let want = lib.join("Originals").join("2026").join("2026-01-14").join("a.png");
     assert!(want.is_file());
     drop(s);

@@ -606,6 +606,24 @@ fn duplicate_copies_the_file_and_the_edits() {
 }
 
 #[test]
+fn duplicate_never_replaces_an_existing_copy_name() {
+    let dir = temp_dir("dup-collision");
+    let original = dir.join("pic.png");
+    let occupied = dir.join("pic-copy.png");
+    write_png(&original, 5);
+    let bytes = std::fs::read(&original).unwrap();
+    std::fs::write(&occupied, b"someone else's file").unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [original.to_string_lossy()]})).unwrap();
+    let result = s.execute("photo.duplicate", &json!({})).unwrap();
+    let id = lightcraft_catalog::PhotoId(result["ids"][0].as_u64().unwrap());
+    assert_eq!(s.catalog.photo(id).unwrap().file_name, "pic-copy-2.png");
+    assert_eq!(std::fs::read(&occupied).unwrap(), b"someone else's file");
+    assert_eq!(std::fs::read(dir.join("pic-copy-2.png")).unwrap(), bytes);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn gps_typed_in_is_saved_to_xmp() {
     let mut s = Session::with_demo();
     let id = s.active().unwrap_or_else(|| s.catalog.photos().next().unwrap().id);

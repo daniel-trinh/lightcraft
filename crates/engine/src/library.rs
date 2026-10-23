@@ -64,6 +64,9 @@ pub struct Library {
     pub forgot_local: Option<lightcraft_catalog::ForgetPlan>,
     presets_written: String,
     view_written: Vec<u8>,
+    /// Settings whose last attempted write failed are retried before the library can close.
+    pub(crate) prefs_dirty: bool,
+    view_dirty: bool,
     /// Settings files that were unreadable or damaged when the library opened (`library.info` →
     /// `settingsWarnings`; shown by the UI once, see [`Session::take_library_warnings`]).
     pub settings_warnings: Vec<String>,
@@ -158,7 +161,7 @@ struct PrefsFile {
     forget_local_days: Option<u32>,
 }
 
-fn presets_json(s: &Session) -> String {
+pub(crate) fn presets_json(s: &Session) -> String {
     let presets = &s.presets;
     let f = PresetsFile {
         user: presets.iter().filter(|p| !p.builtin).cloned().collect(),
@@ -259,7 +262,10 @@ impl Session {
         let reusing = reused.is_some();
         let mut lock = match reused {
             Some(l) => Some(l),
-            None => Some(LibraryLock::acquire(&dir, &program_name()).map_err(|e| EngineError::LibraryInUse(e.to_string()))?),
+            None => Some(LibraryLock::acquire(&dir, &program_name()).map_err(|e| match e {
+                lightcraft_catalog::LockError::InUse(_) => EngineError::LibraryInUse(e.to_string()),
+                lightcraft_catalog::LockError::Unavailable(_) => EngineError::Other(e.to_string()),
+            })?),
         };
         if let Err(e) = self.open_stores(stores, seed_demo, &mut lock) {
             if reusing && let Some(lib) = self.library.as_mut() {
@@ -288,20 +294,25 @@ impl Session {
     /// Open `stores`; the new library takes `lock` once nothing can fail any more.
     fn open_stores(&mut self, stores: LibraryStores, seed_demo: bool, lock: &mut Option<LibraryLock>) -> Result<()> {
         let LibraryStores { dir, catalog, mut files, on_disk } = stores;
-        self.media.smart_dir = on_disk.then(|| crate::smart::dir(&dir));
-        // the current library may be these same files: let its background snapshot land first
-        if let Some(old) = self.library.as_mut()
-            && let Err(e) = old.journal.wait()
-        {
-            log::error!("library: {e}");
-        }
+        // Preserve the old session until every pending change is durable. In particular a
+        // successful open must never clear an append queue left by a failed save.
+        self.close_library()?;
         let (mut journal, mut catalog, report) = Journal::open(catalog)?;
+        if report.created && seed_demo {
+            // Seed into a separate session. A failed snapshot must leave the old journal paired
+            // with its old catalog, so a later close cannot overwrite that library.
+            let mut seeded = Session::new();
+            crate::demo::load(&mut seeded);
+            catalog = seeded.catalog;
+            journal.snapshot(&catalog)?;
+        }
         // A loaded catalog counts revisions from 0, like every other one. Caches (sidebar counts,
         // keyword tree, the grid's list…) are keyed on the revision, so give each library loaded
         // in this process its own range: otherwise an empty library opened after one that was
         // never edited this session would look unchanged and show the old library's numbers.
         static LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         catalog.revision = LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1) << 32;
+        self.media.smart_dir = on_disk.then(|| crate::smart::dir(&dir));
         self.catalog = catalog;
         self.undo.clear();
         self.redo.clear();
@@ -309,10 +320,10 @@ impl Session {
         self.pending_log.clear();
         self.selection = Selection::default();
         self.source = LibrarySource::All;
-        if report.created && seed_demo {
-            crate::demo::load(self);
-            journal.snapshot(&self.catalog)?;
-        }
+        self.browse = None;
+        self.presets = crate::presets::builtin();
+        self.profile_favorites.clear();
+        self.profile_recent.clear();
         let mut settings = SettingsLoad::default();
         // presets
         if let Some(f) = settings.read::<PresetsFile>(files.as_mut(), "presets.json") {
@@ -382,6 +393,8 @@ impl Session {
             forgot_local: None,
             presets_written,
             view_written,
+            prefs_dirty: false,
+            view_dirty: false,
             settings_warnings: settings.warnings,
             warnings_reported: 0,
             blocked: settings.blocked,
@@ -417,12 +430,8 @@ impl Session {
                 lib.retry_at = Some(web_time::Instant::now() + RETRY_BACKOFF);
                 return Err(EngineError::NotSaved(reason));
             }
-            if lib.unsaved_error.take().is_some() {
-                log::info!("library: queued changes written to disk");
-            }
             lib.retry_at = None;
             self.pending_log.clear();
-            lib.last_error = None;
         }
         poll_compaction(lib);
         // Never snapshot mid-interaction: the catalog then holds an uncommitted preview value.
@@ -437,22 +446,64 @@ impl Session {
             lib.last_error = Some(format!("compaction: {e}"));
         }
         let presets = presets_json(self);
+        let prefs = self.library.as_ref().is_some_and(|l| l.prefs_dirty).then(|| self.prefs_json());
+        let view = self.library.as_ref().is_some_and(|l| l.view_dirty).then(|| self.view_json());
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
-        if presets != lib.presets_written && !lib.blocked.contains(&"presets.json") {
-            if let Err(e) = lib.files.write_atomic("presets.json", presets.as_bytes()) {
-                log::error!("library: presets: {e}");
+        let mut failure = None;
+        if presets != lib.presets_written {
+            if lib.blocked.contains(&"presets.json") {
+                failure = Some("presets.json couldn't be read when the library opened; reopen it before saving presets".to_string());
+            } else if let Err(e) = lib.files.write_atomic("presets.json", presets.as_bytes()) {
+                failure = Some(format!("presets.json: {e}"));
             } else {
                 lib.presets_written = presets;
             }
         }
-        Ok(())
+        if let Some(prefs) = prefs {
+            if lib.blocked.contains(&"prefs.json") {
+                failure.get_or_insert_with(|| "prefs.json couldn't be read when the library opened; reopen it before saving preferences".to_string());
+            } else if let Err(e) = lib.files.write_atomic("prefs.json", &prefs) {
+                failure.get_or_insert_with(|| format!("prefs.json: {e}"));
+            } else {
+                lib.prefs_dirty = false;
+            }
+        }
+        if let Some(view) = view {
+            if lib.blocked.contains(&"view.json") {
+                failure.get_or_insert_with(|| "view.json couldn't be read when the library opened; reopen it before saving view state".to_string());
+            } else if let Err(e) = lib.files.write_atomic("view.json", &view) {
+                failure.get_or_insert_with(|| format!("view.json: {e}"));
+            } else {
+                lib.view_written = view;
+                lib.view_dirty = false;
+            }
+        }
+        if let Some(reason) = failure {
+            log::error!("library: setting not written to disk: {reason}");
+            lib.last_error = Some(reason.clone());
+            lib.unsaved_error = Some(reason.clone());
+            lib.retry_at = Some(web_time::Instant::now() + RETRY_BACKOFF);
+            Err(EngineError::NotSaved(reason))
+        } else {
+            let recovered = lib.unsaved_error.take().is_some();
+            if recovered {
+                log::info!("library: queued changes written to disk");
+            }
+            lib.retry_at = None;
+            if recovered && !lib.last_error.as_deref().is_some_and(|e| e.starts_with("compaction:")) {
+                lib.last_error = None;
+            }
+            Ok(())
+        }
     }
 
     /// Persist if commands left ops pending (cheap; frontends call it once per frame for state
     /// changed outside [`Session::execute`]).
     pub fn persist_if_dirty(&mut self) {
         let backing_off = self.library.as_ref().and_then(|l| l.retry_at).is_some_and(|t| web_time::Instant::now() < t);
-        if self.library.is_some() && !self.pending_log.is_empty() && !backing_off {
+        let settings_dirty = self.library.as_ref().is_some_and(|l| l.prefs_dirty || l.view_dirty)
+            || self.library.as_ref().is_some_and(|l| presets_json(self) != l.presets_written);
+        if self.library.is_some() && (!self.pending_log.is_empty() || settings_dirty) && !backing_off {
             let _ = self.persist();
         } else if let Some(lib) = self.library.as_mut() {
             poll_compaction(lib);
@@ -464,7 +515,8 @@ impl Session {
     /// every command and by [`Session::persist_if_dirty`].
     pub fn unsaved(&self) -> Option<(usize, &str)> {
         let lib = self.library.as_ref()?;
-        lib.unsaved_error.as_deref().filter(|_| !self.pending_log.is_empty()).map(|e| (self.pending_log.len(), e))
+        let settings = usize::from(presets_json(self) != lib.presets_written) + usize::from(lib.prefs_dirty) + usize::from(lib.view_dirty);
+        lib.unsaved_error.as_deref().filter(|_| !self.pending_log.is_empty() || settings > 0).map(|e| (self.pending_log.len() + settings, e))
     }
 
     /// Flush everything and write a snapshot (on quit). Ends an open interaction first.
@@ -483,18 +535,29 @@ impl Session {
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
         let before = lib.journal.seq();
         let snapshot = lib.journal.snapshot_with_unlogged(&self.catalog, unlogged);
-        if unlogged > 0 && lib.journal.seq() == before + unlogged {
+        let rescued = unlogged > 0 && lib.journal.seq() == before + unlogged;
+        if rescued {
             // the snapshot holds the queued ops: they are saved, never append them again
             log::info!("library: {unlogged} queued change(s) saved in the closing snapshot");
             self.pending_log.clear();
             lib.unsaved_error = None;
             lib.retry_at = None;
-            lib.last_error = None;
+            if !lib.prefs_dirty && !lib.view_dirty {
+                lib.last_error = None;
+            }
         }
+        let seq_unchanged = lib.journal.seq() == before;
+        if rescued {
+            // The first persist stopped at the failed catalog append, before it could try
+            // presets/prefs/view. Retry those now that the snapshot holds the queued ops;
+            // their own failure must remain visible and block close.
+            let _ = self.persist();
+        }
+        let settings_unsaved = self.unsaved().map(|(_, e)| e.to_string());
         match (persisted, snapshot) {
-            (_, Ok(())) => Ok(()),
+            (_, Ok(())) => settings_unsaved.map_or(Ok(()), |e| Err(EngineError::NotSaved(e))),
             // neither the log nor the snapshot took the queued ops
-            (Err(EngineError::NotSaved(e)), Err(s)) if lib.journal.seq() == before => Err(EngineError::NotSaved(format!("{e}; snapshot: {s}"))),
+            (Err(EngineError::NotSaved(e)), Err(s)) if seq_unchanged => Err(EngineError::NotSaved(format!("{e}; snapshot: {s}"))),
             (_, Err(s)) => Err(s.into()),
         }
     }
@@ -512,18 +575,16 @@ impl Session {
             return;
         }
         let v = self.view_json();
-        let Some(lib) = self.library.as_mut() else { return };
-        if v != lib.view_written && !lib.blocked.contains(&"view.json") {
-            match lib.files.write_atomic("view.json", &v) {
-                Ok(()) => lib.view_written = v,
-                Err(e) => log::error!("library: view: {e}"),
-            }
+        if let Some(lib) = self.library.as_mut()
+            && v != lib.view_written
+        {
+            lib.view_dirty = true;
+            let _ = self.persist();
         }
     }
 
-    /// Save the library preferences (no-op for in-memory sessions).
-    pub fn save_prefs(&mut self) -> Result<()> {
-        let v = serde_json::to_vec_pretty(&PrefsFile {
+    fn prefs_json(&self) -> Vec<u8> {
+        serde_json::to_vec_pretty(&PrefsFile {
             xmp: self.xmp,
             last_export: self.last_export.clone(),
             export_presets: self.export_presets.clone(),
@@ -540,14 +601,15 @@ impl Session {
             smart_previews_dir: self.smart_previews_dir.as_ref().map(|d| d.to_string_lossy().to_string()),
             forget_local_days: Some(self.forget_local_days),
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+    }
+
+    /// Save the library preferences (no-op for in-memory sessions). A failed write stays dirty
+    /// and is retried by later commands, frames and close.
+    pub fn save_prefs(&mut self) -> Result<()> {
         let Some(lib) = self.library.as_mut() else { return Ok(()) };
-        if lib.blocked.contains(&"prefs.json") {
-            return Err(EngineError::Other(
-                "prefs: prefs.json couldn't be read when the library opened, so it isn't overwritten; reopen the library to save preferences".into(),
-            ));
-        }
-        lib.files.write_atomic("prefs.json", &v).map_err(|e| EngineError::Other(format!("prefs: {e}")))
+        lib.prefs_dirty = true;
+        self.persist()
     }
 
     /// Settings-file warnings of the open library not handed out yet (the UI shows each once).

@@ -6,6 +6,12 @@ projects (DrawCraft reached its first four milestones in ≈ 4½ h) and are revi
 
 ## Where we stand
 
+**Data-safety hardening, 2026-10-23:** automatic deletion in legacy Move import is disabled;
+Verified copy retains original media and XMP sidecars. Smart-preview relocation retains old copies,
+rejects conflicting destinations, and ignores aliases of the current folder. Explicit proxy discard
+moves bytes into a recovery folder; folder changes never delete old proxies. Native atomic no-replace rename
+protects file/folder rename and output publication from destination races; unsupported platforms fail safely. Recoverable source cleanup remains unfinished.
+
 **AI fork update, 2026-10-22 (development branch):** optional SAM 3 selects sky, people and described subjects
 or backgrounds, with model results stored in masks. Native FLUX.2 Klein 4B CUDA Fill and Remove
 are integrated into the engine and UI. The pinned public Apache-2.0 model is about 16 GB, with

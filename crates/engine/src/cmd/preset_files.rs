@@ -72,7 +72,9 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| crate::EngineError::Other(format!("{}: {e}", dir.display())))?;
     }
-    std::fs::write(&path, to_lcpreset(&chosen)).map_err(|e| crate::EngineError::Other(format!("{}: {e}", path.display())))?;
+    s.check_write_target(&path.to_string_lossy()).map_err(|e| bad("preset.export", e))?;
+    lightcraft_catalog::safe_file::write_atomic(&path, to_lcpreset(&chosen).as_bytes())
+        .map_err(|e| crate::EngineError::Other(format!("{}: {e}", path.display())))?;
     Ok(json!({"path": path.display().to_string(), "count": chosen.len()}))
 }
 

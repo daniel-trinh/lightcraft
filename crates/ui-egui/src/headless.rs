@@ -1540,8 +1540,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Import review, Move: an explicit choice with its explanation, the confirm button says
-    /// Move; the files land in the folder template, renamed, and leave the card.
+    /// Verified copy: files land in the folder template, renamed; originals stay on the card.
     #[test]
     fn import_move_into_a_folder_template() {
         let base = std::env::temp_dir().join(format!("lc-ui-import-move-{}", std::process::id()));
@@ -1587,7 +1586,7 @@ mod tests {
         assert!(h.app.import.is_none(), "finished");
         let day = dest.join("2026").join("20260114");
         assert!(day.join("20260114_001.png").is_file() && day.join("20260114_002.png").is_file());
-        assert_eq!(std::fs::read_dir(&src).unwrap().count(), 0, "moved off the card");
+        assert_eq!(std::fs::read_dir(&src).unwrap().count(), 2, "originals retained on the card");
         let _ = std::fs::remove_dir_all(&base);
     }
 

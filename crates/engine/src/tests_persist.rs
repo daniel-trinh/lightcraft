@@ -19,6 +19,8 @@ struct Flaky {
     snapshots_only: bool,
     /// Only appends fail (a dead log handle; fresh files can still be written).
     appends_only: bool,
+    /// Only settings files fail (the catalog remains writable).
+    settings_only: bool,
 }
 
 impl Flaky {
@@ -41,13 +43,15 @@ impl Store for Flaky {
         self.files.read(name)
     }
     fn write_atomic(&mut self, name: &str, data: &[u8]) -> std::io::Result<()> {
-        if self.failing() && !self.appends_only {
+        if self.failing()
+            && (self.settings_only && matches!(name, "presets.json" | "prefs.json" | "view.json") || !self.appends_only && !self.settings_only)
+        {
             return Err(std::io::Error::other("disk full"));
         }
         self.files.write_atomic(name, data)
     }
     fn append(&mut self, name: &str, data: &[u8]) -> std::io::Result<()> {
-        if self.failing() && !self.snapshots_only {
+        if self.failing() && !self.snapshots_only && !self.settings_only {
             return Err(std::io::Error::other("disk full"));
         }
         self.files.append(name, data)
@@ -190,4 +194,111 @@ fn close_fails_when_nothing_can_be_saved() {
     store.set_failing(false);
     s.close_library().unwrap();
     assert_eq!(s.unsaved(), None);
+}
+
+/// Regression proof: a failed switch must leave the prior library connected to its own state.
+#[test]
+fn failed_demo_open_does_not_replace_the_previous_catalog() {
+    let a = Flaky::default();
+    let mut s = open(&a, true);
+    s.execute("album.create", &json!({"name": "Keep in A"})).unwrap();
+    let expected_albums = s.catalog.albums().count();
+
+    let b = Flaky::default();
+    b.set_failing(true); // Journal::open continues, but seeding B's demo snapshot fails.
+    let stores = LibraryStores { dir: "broken-b".into(), catalog: Box::new(b), files: Box::new(MemStore::new()), on_disk: false };
+    assert!(s.open_library_in(stores, true).is_err());
+
+    // This close currently snapshots B's in-memory demo into A's still-open journal.
+    s.close_library().unwrap();
+    drop(s);
+    assert_eq!(open(&a, false).catalog.albums().count(), expected_albums, "A's saved album was overwritten");
+}
+
+#[test]
+fn failed_preset_save_is_reported_retried_and_blocks_close() {
+    let catalog = MemStore::new();
+    let files = Flaky { settings_only: true, ..Default::default() };
+    let stores = LibraryStores { dir: "settings-failure".into(), catalog: Box::new(catalog.clone()), files: Box::new(files.clone()), on_disk: false };
+    let mut s = Session::new();
+    s.open_library_in(stores, true).unwrap();
+    files.set_failing(true);
+    assert!(matches!(s.execute("preset.create", &json!({"name": "Keep Me"})), Err(EngineError::NotSaved(_))));
+    assert!(s.unsaved().is_some());
+    assert!(matches!(s.close_library(), Err(EngineError::NotSaved(_))));
+    files.set_failing(false);
+    s.close_library().unwrap();
+    drop(s);
+    let stores = LibraryStores { dir: "settings-failure".into(), catalog: Box::new(catalog), files: Box::new(files), on_disk: false };
+    let mut fresh = Session::new();
+    fresh.open_library_in(stores, false).unwrap();
+    assert!(fresh.presets.iter().any(|p| p.name == "Keep Me"));
+}
+
+#[test]
+fn failed_preferences_save_is_retained_until_retry() {
+    let catalog = MemStore::new();
+    let files = Flaky { settings_only: true, ..Default::default() };
+    let stores =
+        LibraryStores { dir: "preferences-failure".into(), catalog: Box::new(catalog.clone()), files: Box::new(files.clone()), on_disk: false };
+    let mut s = Session::new();
+    s.open_library_in(stores, false).unwrap();
+    files.set_failing(true);
+    assert!(matches!(s.execute("library.xmpPreferences", &json!({"autoWrite": true})), Err(EngineError::NotSaved(_))));
+    assert!(s.xmp.auto_write);
+    assert!(s.unsaved().is_some());
+    assert!(matches!(s.close_library(), Err(EngineError::NotSaved(_))));
+    files.set_failing(false);
+    s.close_library().unwrap();
+    drop(s);
+    let stores = LibraryStores { dir: "preferences-failure".into(), catalog: Box::new(catalog), files: Box::new(files), on_disk: false };
+    let mut fresh = Session::new();
+    fresh.open_library_in(stores, false).unwrap();
+    assert!(fresh.xmp.auto_write);
+}
+
+#[test]
+fn switching_libraries_refuses_to_drop_unsaved_catalog_ops() {
+    let a = Flaky::default();
+    let mut s = open(&a, true);
+    let id = s.active().unwrap();
+    a.set_failing(true);
+    assert!(matches!(s.execute("photo.rate", &json!({"rating": 4})), Err(EngineError::NotSaved(_))));
+    let b = MemStore::new();
+    let stores = LibraryStores { dir: "other".into(), catalog: Box::new(b), files: Box::new(MemStore::new()), on_disk: false };
+    assert!(matches!(s.open_library_in(stores, false), Err(EngineError::NotSaved(_))));
+    assert_eq!(s.catalog.photo(id).unwrap().rating, 4);
+    assert_eq!(s.unsaved().map(|u| u.0), Some(1));
+    a.set_failing(false);
+    s.close_library().unwrap();
+    drop(s);
+    assert_eq!(open(&a, false).catalog.photo(id).unwrap().rating, 4);
+}
+
+#[test]
+fn snapshot_rescue_does_not_hide_a_failed_preset_save() {
+    let catalog = Flaky { appends_only: true, ..Default::default() };
+    let files = Flaky { settings_only: true, ..Default::default() };
+    let stores = LibraryStores { dir: "combined-failure".into(), catalog: Box::new(catalog.clone()), files: Box::new(files.clone()), on_disk: false };
+    let mut s = Session::new();
+    s.open_library_in(stores, true).unwrap();
+    let id = s.active().unwrap();
+
+    files.set_failing(true);
+    assert!(matches!(s.execute("preset.create", &json!({"name": "Keep Me"})), Err(EngineError::NotSaved(_))));
+    catalog.set_failing(true);
+    assert!(matches!(s.execute("photo.rate", &json!({"rating": 4})), Err(EngineError::NotSaved(_))));
+
+    // The snapshot can save the rating despite the broken log. The preset remains unsaved.
+    assert!(matches!(s.close_library(), Err(EngineError::NotSaved(_))));
+    assert_eq!(s.unsaved().map(|u| u.0), Some(1));
+    files.set_failing(false);
+    s.close_library().unwrap();
+    drop(s);
+
+    let stores = LibraryStores { dir: "combined-failure".into(), catalog: Box::new(catalog), files: Box::new(files), on_disk: false };
+    let mut fresh = Session::new();
+    fresh.open_library_in(stores, false).unwrap();
+    assert_eq!(fresh.catalog.photo(id).unwrap().rating, 4);
+    assert!(fresh.presets.iter().any(|p| p.name == "Keep Me"));
 }
